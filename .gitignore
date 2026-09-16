@@ -1,0 +1,22 @@
+# Secretos y Entornos
+.env
+*.key
+*.pem
+tests/
+
+# Entornos Virtuales & Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+*.sqlite3
+*.log
+
+# IDEs & Editores
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

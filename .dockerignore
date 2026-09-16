@@ -1,0 +1,9 @@
+# Exclusiones de construcción de imagen Docker para Backend
+tests/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.key/
+*.log
