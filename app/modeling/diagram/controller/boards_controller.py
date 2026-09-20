@@ -57,6 +57,7 @@ async def _get_board_summary_info(db: AsyncSession, board_id: str) -> tuple[int,
 
 from app.core.dependencies import (
     get_current_user,
+    get_current_user_optional,
     require_board_access,
     BoardAuthContext,
 )
@@ -70,6 +71,21 @@ async def create_board(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if data.project_id:
+        from app.workspace.projects.entity.project_entity import Project, ProjectMember, ProjectRole
+        project = await db.get(Project, data.project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Proyecto no encontrado")
+        if project.owner_id != current_user.id:
+            stmt = select(ProjectMember).where(
+                ProjectMember.project_id == data.project_id,
+                ProjectMember.user_id == current_user.id,
+            )
+            res = await db.execute(stmt)
+            pm = res.scalar_one_or_none()
+            if not pm or ROLE_LEVELS[pm.role] < ROLE_LEVELS[ProjectRole.editor]:
+                raise HTTPException(status_code=403, detail="Permisos insuficientes para crear tableros en este proyecto")
+
     board = await board_service.create_board(
         db,
         name=data.name,
