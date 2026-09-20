@@ -12,4 +12,5 @@ def user_to_profile_dto(user: User) -> UserProfile:
         email=user.email,
         avatar_url=user.avatar_url,
         created_at=str(user.created_at) if user.created_at else None,
+        updated_at=str(user.updated_at) if user.updated_at else None,
     )

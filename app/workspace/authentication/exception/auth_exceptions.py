@@ -22,3 +22,13 @@ class UserAlreadyExistsException(AuthException):
 class UserNotFoundException(AuthException):
     def __init__(self, detail: str = "Usuario no encontrado"):
         super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+class InvalidTokenException(AuthException):
+    def __init__(self, detail: str = "Token inválido o no reconocido"):
+        super().__init__(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
+
+
+class TokenExpiredException(AuthException):
+    def __init__(self, detail: str = "El token ha expirado o ya fue utilizado"):
+        super().__init__(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail)
