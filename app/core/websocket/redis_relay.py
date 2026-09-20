@@ -84,6 +84,13 @@ async def _relay_loop(board_id: str, mgr: "ConnectionManager") -> None:
                     uid = data_payload.get("user_id")
                     if uid:
                         mgr.remove_remote_presence(board_id, uid)
+
+                elif msg_type == "member:kicked":
+                    kicked_uid = msg.get("user_id")
+                    kicked_reason = msg.get("reason", "Acceso revocado")
+                    if kicked_uid:
+                        await mgr.kick_local(board_id, kicked_uid, kicked_reason)
+                    continue
             except Exception as sync_exc:
                 logger.warning(
                     "Error al sincronizar estado en réplica local para mensaje %s en board %s: %s",

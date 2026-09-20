@@ -41,17 +41,28 @@ async def list_boards(db: AsyncSession, owner_id: str | None = None) -> list[Boa
     return list(result.scalars().all())
 
 
-async def list_boards_for_user(db: AsyncSession, user_id: str) -> list[Board]:
-    """Retorna tableros donde el usuario es owner o es miembro del proyecto asociado."""
+DEMO_OWNERS = {"system", "user-test", "demo", "public", "00000000-0000-0000-0000-000000000001"}
+
+
+async def list_boards_for_user(db: AsyncSession, user_id: str | None) -> list[Board]:
+    """Retorna tableros donde el usuario es owner o miembro del proyecto asociado, mas tableros demo/publicos."""
     from app.workspace.projects.entity.project_entity import Project, ProjectMember
 
-    member_proj_stmt = select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
-    all_proj_stmt = select(Project.id).where(
-        (Project.owner_id == user_id) | (Project.id.in_(member_proj_stmt))
-    )
+    demo_proj_stmt = select(Project.id).where(Project.owner_id.in_(DEMO_OWNERS))
+    demo_cond = (Board.owner_id.in_(DEMO_OWNERS)) | (Board.project_id.in_(demo_proj_stmt))
+
+    if user_id:
+        member_proj_stmt = select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
+        all_proj_stmt = select(Project.id).where(
+            (Project.owner_id == user_id) | (Project.id.in_(member_proj_stmt))
+        )
+        filter_cond = demo_cond | (Board.owner_id == user_id) | (Board.project_id.in_(all_proj_stmt))
+    else:
+        filter_cond = demo_cond
+
     stmt = (
         select(Board)
-        .where((Board.owner_id == user_id) | (Board.project_id.in_(all_proj_stmt)))
+        .where(filter_cond)
         .order_by(Board.updated_at.desc().nullslast(), Board.created_at.desc())
     )
     result = await db.execute(stmt)
@@ -143,20 +154,30 @@ async def save_snapshot_normalized(
     )
     effective_actor_type = ActorTypeEnum.ai if is_ai else ActorTypeEnum.user
 
-    history_entry = BoardHistory(
-        id=str(uuid.uuid4()),
-        board_id=board_id,
-        command_id=command_id,
-        command_type=command_type,
-        payload=payload,
-        actor_id=actor_id,
-        actor_type=effective_actor_type,
-        model_version=model_version,
-    )
-    db.add(history_entry)
+    history_id = None
+    if command_id:
+        existing_h = await db.execute(
+            select(BoardHistory).where(BoardHistory.command_id == command_id)
+        )
+        existing_entry = existing_h.scalar_one_or_none()
+        if existing_entry:
+            history_id = existing_entry.id
+        else:
+            history_entry = BoardHistory(
+                id=str(uuid.uuid4()),
+                board_id=board_id,
+                command_id=command_id,
+                command_type=command_type,
+                payload=payload,
+                actor_id=actor_id,
+                actor_type=effective_actor_type,
+                model_version=model_version,
+            )
+            db.add(history_entry)
+            history_id = history_entry.id
 
     # 1.1 Si el comando proviene de IA, vincular board_history_id en ai_action
-    if is_ai and command_id:
+    if is_ai and command_id and history_id:
         from app.modeling.ai.entity.chat_entity import AiAction, ActionStatus
         ai_stmt = (
             select(AiAction)
@@ -169,7 +190,7 @@ async def save_snapshot_normalized(
         ai_res = await db.execute(ai_stmt)
         ai_act = ai_res.scalar_one_or_none()
         if ai_act:
-            ai_act.board_history_id = history_entry.id
+            ai_act.board_history_id = history_id
             ai_act.status = ActionStatus.success
 
     # 2. Optimistic locking en boards
@@ -184,15 +205,21 @@ async def save_snapshot_normalized(
         await db.rollback()
         return False
 
-    # 3. board_snapshots — caché regenerable
-    snapshot_entry = BoardSnapshot(
-        id=str(uuid.uuid4()),
-        board_id=board_id,
-        version=model_version,
-        snapshot=state,
-        created_by=actor_id,
+    # 3. board_snapshots — caché regenerable (idempotente)
+    snap_stmt = select(BoardSnapshot).where(
+        BoardSnapshot.board_id == board_id,
+        BoardSnapshot.version == model_version,
     )
-    db.add(snapshot_entry)
+    snap_res = await db.execute(snap_stmt)
+    if not snap_res.scalar_one_or_none():
+        snapshot_entry = BoardSnapshot(
+            id=str(uuid.uuid4()),
+            board_id=board_id,
+            version=model_version,
+            snapshot=state,
+            created_by=actor_id,
+        )
+        db.add(snapshot_entry)
 
     await db.commit()
     return True

@@ -40,3 +40,19 @@ class CommandPayload(BaseModel):
     source_attribute: str | None = None
     target_attribute: str | None = None
     association_id: str | None = None
+    # Resize fields
+    width: float | None = None
+    height: float | None = None
+    # Package fields
+    package_id: str | None = None
+    package_name: str | None = None
+    # Role and multiplicity fields
+    source_role: str | None = None
+    target_role: str | None = None
+    source_multiplicity: str | None = None
+    target_multiplicity: str | None = None
+    # Classifier metadata
+    is_abstract: bool | None = None
+    element_type: str | None = None
+
+    model_config = {"extra": "allow"}

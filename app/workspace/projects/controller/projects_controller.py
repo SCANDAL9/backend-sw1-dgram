@@ -5,22 +5,26 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, or_
 from app.core.database import get_db
 from app.workspace.projects.entity.project_entity import Project, ProjectMember, ProjectRole, ProjectMemory
 from app.workspace.authentication.entity.user_entity import User
 from app.modeling.diagram.entity.board_entity import Board
 from app.modeling.diagram.service.relational_mutator_service import ensure_project_and_package
+from app.core.websocket.manager import manager
 
 from app.core.dependencies import (
     require_project_role,
     require_board_access,
     get_current_user,
+    get_current_user_optional,
     ProjectAuthContext,
     BoardAuthContext,
+    DEMO_OWNERS,
 )
 from app.workspace.projects.dto.project_dto import (
     MemberInvite,
+    MemberRoleUpdate,
     MemberResponse,
     ProjectCreate,
     ProjectResponse,
@@ -128,7 +132,49 @@ async def remove_project_member(
     await db.commit()
     if res.rowcount == 0:
         raise HTTPException(status_code=404, detail="Miembro no encontrado")
+
+    # Expulsar de los websockets de todos los boards asociados al proyecto
+    boards_res = await db.execute(select(Board.id).where(Board.project_id == project_id))
+    for b_id in boards_res.scalars().all():
+        await manager.kick_user(b_id, user_id, "Membresía del proyecto revocada")
+
     return {"status": "removed"}
+
+
+@router.put("/projects/{project_id}/members/{user_id}", response_model=MemberResponse)
+async def update_project_member_role(
+    project_id: str,
+    user_id: str,
+    data: MemberRoleUpdate,
+    db: AsyncSession = Depends(get_db),
+    auth: ProjectAuthContext = Depends(require_project_role(ProjectRole.owner)),
+):
+    if user_id == auth.project.owner_id and data.role != ProjectRole.owner:
+        raise HTTPException(status_code=400, detail="No se puede cambiar el rol del owner principal")
+
+    stmt = select(ProjectMember).where(
+        ProjectMember.project_id == project_id, ProjectMember.user_id == user_id
+    )
+    res = await db.execute(stmt)
+    pm = res.scalar_one_or_none()
+    if not pm:
+        raise HTTPException(status_code=404, detail="Miembro no encontrado")
+
+    pm.role = data.role
+    await db.commit()
+    await db.refresh(pm)
+
+    user_stmt = select(User).where(User.id == user_id)
+    user_res = await db.execute(user_stmt)
+    user = user_res.scalar_one_or_none()
+
+    return MemberResponse(
+        user_id=user.id if user else user_id,
+        email=user.email if user else "",
+        full_name=user.full_name if user else "",
+        role=pm.role.value if hasattr(pm.role, "value") else str(pm.role),
+        joined_at=str(pm.joined_at) if pm.joined_at else None,
+    )
 
 
 @router.get("/boards/{board_id}/members", response_model=list[MemberResponse])
@@ -154,6 +200,46 @@ async def invite_board_member(
     project_id, _ = await ensure_project_and_package(db, board)
     await db.commit()
     return await invite_project_member(project_id, data, db=db, auth=ProjectAuthContext(user=auth.user, project=auth.project or board, role=auth.role))
+
+
+@router.put("/boards/{board_id}/members/{user_id}", response_model=MemberResponse)
+async def update_board_member_role(
+    board_id: str,
+    user_id: str,
+    data: MemberRoleUpdate,
+    db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.owner)),
+):
+    board = auth.board
+    project_id, _ = await ensure_project_and_package(db, board)
+    await db.commit()
+    return await update_project_member_role(
+        project_id,
+        user_id,
+        data,
+        db=db,
+        auth=ProjectAuthContext(user=auth.user, project=auth.project or board, role=auth.role),
+    )
+
+
+@router.delete("/boards/{board_id}/members/{user_id}")
+async def remove_board_member(
+    board_id: str,
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.viewer)),
+):
+    board = auth.board
+    project_id, _ = await ensure_project_and_package(db, board)
+    await db.commit()
+    res = await remove_project_member(
+        project_id,
+        user_id,
+        db=db,
+        auth=ProjectAuthContext(user=auth.user, project=auth.project or board, role=auth.role),
+    )
+    await manager.kick_user(board_id, user_id, "Acceso revocado del tablero")
+    return res
 
 
 # Catálogo de clases y utilidades de proyecto
@@ -266,12 +352,19 @@ async def attach_class_to_board(
     db: AsyncSession = Depends(get_db),
     auth: BoardAuthContext = Depends(require_board_access(ProjectRole.editor)),
 ):
-    from app.modeling.diagram.entity.uml_entity import ClassElement
+    from app.modeling.diagram.entity.uml_entity import ClassElement, Package
     from app.modeling.diagram.entity.board_normalized_entity import BoardElement
 
     cls = await db.get(ClassElement, class_id)
     if not cls:
         raise HTTPException(status_code=404, detail="Clase no encontrada")
+
+    # Validar que la clase pertenezca al mismo proyecto del tablero (Resource Isolation / Anti-IDOR)
+    board = auth.board
+    project_id, _ = await ensure_project_and_package(db, board)
+    pkg = await db.get(Package, cls.package_id)
+    if not pkg or pkg.project_id != project_id:
+        raise HTTPException(status_code=403, detail="La clase no pertenece al proyecto de este tablero")
 
     be_stmt = select(BoardElement).where(
         BoardElement.board_id == board_id,
@@ -312,37 +405,78 @@ async def attach_class_to_board(
 # CRUD de Proyectos
 @router.get("/projects", response_model=list[ProjectResponse])
 async def list_projects(
+    search: str | None = Query(None, description="Filtrar por nombre o descripción"),
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
 ):
-    owned_stmt = select(Project).where(Project.owner_id == user.id)
-    owned_res = await db.execute(owned_stmt)
-    owned_projects = owned_res.scalars().all()
+    # Proyectos demo / públicos visibles para invitados y cualquier usuario registrado
+    demo_stmt = select(Project).where(Project.owner_id.in_(DEMO_OWNERS))
+    if search:
+        search_filter = f"%{search.strip()}%"
+        demo_stmt = demo_stmt.where(
+            or_(Project.name.ilike(search_filter), Project.description.ilike(search_filter))
+        )
+    demo_res = await db.execute(demo_stmt)
+    demo_projects = demo_res.scalars().all()
 
-    member_stmt = (
-        select(Project, ProjectMember.role)
-        .join(ProjectMember, Project.id == ProjectMember.project_id)
-        .where(ProjectMember.user_id == user.id)
-    )
-    member_res = await db.execute(member_stmt)
-    member_rows = member_res.all()
+    owned_projects = []
+    member_rows = []
+
+    if user:
+        owned_stmt = select(Project).where(Project.owner_id == user.id)
+        if search:
+            search_filter = f"%{search.strip()}%"
+            owned_stmt = owned_stmt.where(
+                or_(Project.name.ilike(search_filter), Project.description.ilike(search_filter))
+            )
+        owned_res = await db.execute(owned_stmt)
+        owned_projects = owned_res.scalars().all()
+
+        member_stmt = (
+            select(Project, ProjectMember.role)
+            .join(ProjectMember, Project.id == ProjectMember.project_id)
+            .where(ProjectMember.user_id == user.id)
+        )
+        if search:
+            search_filter = f"%{search.strip()}%"
+            member_stmt = member_stmt.where(
+                or_(Project.name.ilike(search_filter), Project.description.ilike(search_filter))
+            )
+        member_res = await db.execute(member_stmt)
+        member_rows = member_res.all()
 
     seen_ids = set()
     result = []
 
-    for p in owned_projects:
-        seen_ids.add(p.id)
-        result.append(
-            ProjectResponse(
-                id=p.id,
-                name=p.name,
-                description=p.description,
-                owner_id=p.owner_id,
-                my_role="owner",
-                created_at=str(p.created_at) if p.created_at else None,
-                updated_at=str(p.updated_at) if p.updated_at else None,
+    for p in demo_projects:
+        if p.id not in seen_ids:
+            seen_ids.add(p.id)
+            result.append(
+                ProjectResponse(
+                    id=p.id,
+                    name=p.name,
+                    description=p.description,
+                    owner_id=p.owner_id,
+                    my_role="owner",
+                    created_at=str(p.created_at) if p.created_at else None,
+                    updated_at=str(p.updated_at) if p.updated_at else None,
+                )
             )
-        )
+
+    for p in owned_projects:
+        if p.id not in seen_ids:
+            seen_ids.add(p.id)
+            result.append(
+                ProjectResponse(
+                    id=p.id,
+                    name=p.name,
+                    description=p.description,
+                    owner_id=p.owner_id,
+                    my_role="owner",
+                    created_at=str(p.created_at) if p.created_at else None,
+                    updated_at=str(p.updated_at) if p.updated_at else None,
+                )
+            )
 
     for p, role in member_rows:
         if p.id not in seen_ids:

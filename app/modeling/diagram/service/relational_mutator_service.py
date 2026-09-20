@@ -90,13 +90,14 @@ async def apply_command_to_relational_db(
         elem_type_raw = payload.get("element_type") or payload.get("elementType") or payload.get("stereotype")
         classifier_type = parse_classifier_type(elem_type_raw)
         is_abs = bool(payload.get("is_abstract", False) or payload.get("isAbstract", False) or classifier_type == ClassifierType.abstract_class)
+        chosen_pkg_id = payload.get("package_id") or package_id
 
         # Verificar si ya existe
         existing_class = await db.get(ClassElement, class_id)
         if not existing_class:
             new_class = ClassElement(
                 id=class_id,
-                package_id=package_id,
+                package_id=chosen_pkg_id,
                 name=class_name,
                 element_type=classifier_type,
                 is_abstract=is_abs,
@@ -107,12 +108,16 @@ async def apply_command_to_relational_db(
 
             # Añadir BoardElement para layout
             pos = payload.get("position") or {"x": 100.0, "y": 100.0}
+            w = payload.get("width")
+            h = payload.get("height")
             board_elem = BoardElement(
                 id=str(uuid.uuid4()),
                 board_id=board_id,
                 class_id=class_id,
                 x=float(pos.get("x", 100.0)),
                 y=float(pos.get("y", 100.0)),
+                width=float(w) if w is not None else None,
+                height=float(h) if h is not None else None,
             )
             db.add(board_elem)
 
@@ -156,6 +161,8 @@ async def apply_command_to_relational_db(
                     cls_obj.element_type = parse_classifier_type(elem_type_raw)
                 if "is_abstract" in payload or "isAbstract" in payload:
                     cls_obj.is_abstract = bool(payload.get("is_abstract", False) or payload.get("isAbstract", False))
+                if payload.get("package_id"):
+                    cls_obj.package_id = payload["package_id"]
 
     # 4. Mover Entidad en Canvas
     elif cmd_type in ("MOVE_ENTITY", "MOVE_CLASS"):
@@ -169,6 +176,56 @@ async def apply_command_to_relational_db(
             if be:
                 be.x = float(pos.get("x", be.x))
                 be.y = float(pos.get("y", be.y))
+
+    # 4.b Redimensionar Entidad en Canvas
+    elif cmd_type in ("RESIZE_ENTITY", "RESIZE_CLASS"):
+        raw_id = payload.get("entity_id") or payload.get("class_id")
+        if raw_id:
+            class_id = coerce_uuid(raw_id)
+            stmt = select(BoardElement).where(BoardElement.board_id == board_id, BoardElement.class_id == class_id)
+            res = await db.execute(stmt)
+            be = res.scalar_one_or_none()
+            if be:
+                if payload.get("width") is not None:
+                    be.width = float(payload["width"])
+                if payload.get("height") is not None:
+                    be.height = float(payload["height"])
+
+    # 4.c Asignar Clase a Paquete
+    elif cmd_type in ("ASSIGN_CLASS_PACKAGE",):
+        raw_id = payload.get("entity_id") or payload.get("class_id")
+        target_pkg = payload.get("package_id")
+        if raw_id and target_pkg:
+            class_id = coerce_uuid(raw_id)
+            cls_obj = await db.get(ClassElement, class_id)
+            if cls_obj:
+                cls_obj.package_id = target_pkg
+
+    # 4.d Gestión de Paquetes UML
+    elif cmd_type in ("CREATE_PACKAGE",):
+        pkg_id = payload.get("package_id") or str(uuid.uuid4())
+        pkg_name = payload.get("package_name") or payload.get("name") or "New Package"
+        existing_pkg = await db.get(Package, pkg_id)
+        if not existing_pkg:
+            new_pkg = Package(id=pkg_id, project_id=project_id, name=pkg_name)
+            db.add(new_pkg)
+
+    elif cmd_type in ("UPDATE_PACKAGE",):
+        pkg_id = payload.get("package_id")
+        pkg_name = payload.get("package_name") or payload.get("name")
+        if pkg_id and pkg_name:
+            pkg_obj = await db.get(Package, pkg_id)
+            if pkg_obj:
+                pkg_obj.name = pkg_name
+
+    elif cmd_type in ("DELETE_PACKAGE",):
+        pkg_id = payload.get("package_id")
+        if pkg_id and pkg_id != package_id:
+            # Reasignar clases al paquete default antes de eliminar
+            await db.execute(
+                update(ClassElement).where(ClassElement.package_id == pkg_id).values(package_id=package_id)
+            )
+            await db.execute(delete(Package).where(Package.id == pkg_id))
 
     # 5. Añadir Columna / Atributo
     elif cmd_type in ("ADD_COLUMN", "ADD_ATTRIBUTE"):
@@ -238,8 +295,32 @@ async def apply_command_to_relational_db(
                 target_class_id=tgt_id,
                 type=parse_assoc_type(rel_type_str),
                 name=payload.get("name"),
+                source_role=payload.get("source_role"),
+                target_role=payload.get("target_role"),
+                source_multiplicity=payload.get("source_multiplicity"),
+                target_multiplicity=payload.get("target_multiplicity"),
             )
             db.add(assoc)
+
+    # 8.b Actualizar Relación / Asociación
+    elif cmd_type in ("UPDATE_RELATION", "UPDATE_ASSOCIATION"):
+        raw_id = payload.get("relation_id") or payload.get("association_id")
+        if raw_id:
+            assoc_id = coerce_uuid(raw_id)
+            assoc = await db.get(Association, assoc_id)
+            if assoc:
+                if payload.get("name") is not None:
+                    assoc.name = payload["name"]
+                if payload.get("relation_type") or payload.get("association_type") or payload.get("type"):
+                    assoc.type = parse_assoc_type(payload.get("relation_type") or payload.get("association_type") or payload.get("type"))
+                if "source_role" in payload:
+                    assoc.source_role = payload["source_role"]
+                if "target_role" in payload:
+                    assoc.target_role = payload["target_role"]
+                if "source_multiplicity" in payload:
+                    assoc.source_multiplicity = payload["source_multiplicity"]
+                if "target_multiplicity" in payload:
+                    assoc.target_multiplicity = payload["target_multiplicity"]
 
     # 9. Eliminar Relación / Asociación
     elif cmd_type in ("DELETE_RELATION", "DELETE_ASSOCIATION"):

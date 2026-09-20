@@ -1,22 +1,40 @@
 """
 xmi_controller.py — Endpoints de Importación y Exportación XMI 2.1 (Enterprise Architect).
+Soporta inspección previa (preview), deduplicación activa por external_ref y nombre,
+extracción de roles y multiplicidades, consistencia con board_history y difusión WebSocket en tiempo real.
 """
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, delete
 from app.core.database import get_db
 from app.modeling.diagram.entity.board_entity import Board
-from app.modeling.diagram.entity.uml_entity import Package, ClassElement, Attribute, Association, ClassifierType, VisibilityEnum, AssociationType
-from app.modeling.diagram.entity.board_normalized_entity import BoardElement
+from app.modeling.diagram.entity.uml_entity import (
+    Package, ClassElement, Attribute, Association,
+    ClassifierType, VisibilityEnum, AssociationType
+)
+from app.modeling.diagram.entity.board_normalized_entity import BoardElement, BoardHistory, BoardSnapshot, ActorTypeEnum
 from app.modeling.diagram.service.relational_mutator_service import ensure_project_and_package
 from app.generation.schema.service.xmi_service import XmiExporter, XmiImporter
 from app.generation.schema.mapper.schema_mapper import SchemaMapper
+from app.generation.schema.dto.xmi_dto import (
+    XmiPreviewResponseDTO, XmiPreviewClassDTO, XmiPreviewAssociationDTO, XmiImportResponse
+)
+from app.workspace.history.service.state_reconstructor_service import get_normalized_board_state
+from app.core.websocket.manager import manager
+
+from app.workspace.projects.entity.project_entity import ProjectRole
+from app.core.dependencies import require_board_access, BoardAuthContext
 
 router = APIRouter()
 
 
 @router.get("/boards/{board_id}/export/xmi")
-async def export_board_xmi(board_id: str, db: AsyncSession = Depends(get_db)):
+async def export_board_xmi(
+    board_id: str,
+    db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.viewer)),
+):
     """Exporta el diagrama y modelo del tablero a formato XMI 2.1 compatible con Enterprise Architect."""
     board = await db.get(Board, board_id)
     if not board:
@@ -85,13 +103,129 @@ async def export_board_xmi(board_id: str, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.post("/boards/{board_id}/import/xmi")
+@router.post("/boards/{board_id}/import/xmi/preview", response_model=XmiPreviewResponseDTO)
+async def preview_board_xmi(
+    board_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.viewer)),
+):
+    """
+    Inspección previa sin mutación: parsea el XMI y compara contra el estado actual
+    para informar qué clases se crearán, cuáles se actualizarán y posibles advertencias.
+    """
+    board = await db.get(Board, board_id)
+    if not board:
+        raise HTTPException(status_code=404, detail="Board not found")
+
+    project_id, package_id = await ensure_project_and_package(db, board)
+    await db.commit()
+
+    try:
+        content_bytes = await file.read()
+        xml_str = content_bytes.decode("utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"No se pudo leer el archivo XML: {str(e)}")
+
+    importer = XmiImporter()
+    try:
+        parsed = importer.parse(xml_str)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Error al procesar XMI: {str(e)}")
+
+    # Obtener clases existentes en el paquete
+    existing_stmt = select(ClassElement).where(ClassElement.package_id == package_id)
+    existing_res = await db.execute(existing_stmt)
+    existing_classes = existing_res.scalars().all()
+
+    existing_by_ext_ref = {c.external_ref: c for c in existing_classes if c.external_ref}
+    existing_by_name = {c.name.lower(): c for c in existing_classes}
+
+    classes_to_create: list[XmiPreviewClassDTO] = []
+    classes_to_update: list[XmiPreviewClassDTO] = []
+    warnings: list[str] = []
+
+    parsed_class_ids = set()
+
+    for cls in parsed.get("classes", []):
+        c_name = cls.get("name")
+        if not c_name:
+            warnings.append("Se detectó una clase sin nombre en el XMI; será ignorada.")
+            continue
+
+        c_id = cls.get("id")
+        parsed_class_ids.add(c_id)
+        parsed_class_ids.add(c_name)
+
+        ext_ref = cls.get("external_ref")
+        existing_match = None
+        if ext_ref and ext_ref in existing_by_ext_ref:
+            existing_match = existing_by_ext_ref[ext_ref]
+        elif c_name.lower() in existing_by_name:
+            existing_match = existing_by_name[c_name.lower()]
+
+        attr_names = [a.get("name", "attr") for a in cls.get("attributes", [])]
+        action = "update" if existing_match else "create"
+
+        dto = XmiPreviewClassDTO(
+            name=c_name,
+            external_ref=ext_ref,
+            element_type=cls.get("element_type", "class"),
+            is_abstract=cls.get("is_abstract", False),
+            attributes_count=len(attr_names),
+            attributes=attr_names,
+            action=action,
+        )
+
+        if action == "update":
+            classes_to_update.append(dto)
+        else:
+            classes_to_create.append(dto)
+
+    preview_assocs: list[XmiPreviewAssociationDTO] = []
+    for assoc in parsed.get("associations", []):
+        src_raw = assoc.get("sourceId")
+        tgt_raw = assoc.get("targetId")
+
+        if src_raw not in parsed_class_ids or tgt_raw not in parsed_class_ids:
+            warnings.append(
+                f"Relación '{assoc.get('name') or assoc.get('type')}' hace referencia a un clasificador no encontrado en el archivo."
+            )
+            continue
+
+        preview_assocs.append(
+            XmiPreviewAssociationDTO(
+                type=assoc.get("type", "Association"),
+                source_name=str(src_raw),
+                target_name=str(tgt_raw),
+                name=assoc.get("name"),
+                source_role=assoc.get("source_role"),
+                target_role=assoc.get("target_role"),
+                source_multiplicity=assoc.get("source_multiplicity"),
+                target_multiplicity=assoc.get("target_multiplicity"),
+            )
+        )
+
+    return XmiPreviewResponseDTO(
+        total_classes=len(classes_to_create) + len(classes_to_update),
+        classes_to_create=classes_to_create,
+        classes_to_update=classes_to_update,
+        associations=preview_assocs,
+        warnings=warnings,
+    )
+
+
+@router.post("/boards/{board_id}/import/xmi", response_model=XmiImportResponse)
 async def import_board_xmi(
     board_id: str,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.editor)),
 ):
-    """Importa un archivo XMI/XML de Enterprise Architect al tablero actual."""
+    """
+    Importa un archivo XMI/XML de Enterprise Architect al tablero con deduplicación activa,
+    soporte de roles/multiplicidades, registro en board_history y difusión WebSocket.
+    """
     board = await db.get(Board, board_id)
     if not board:
         raise HTTPException(status_code=404, detail="Board not found")
@@ -110,7 +244,16 @@ async def import_board_xmi(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Error al procesar XMI: {str(e)}")
 
-    imported_classes = []
+    # Clases existentes para deduplicación
+    existing_stmt = select(ClassElement).where(ClassElement.package_id == package_id)
+    existing_res = await db.execute(existing_stmt)
+    existing_classes = existing_res.scalars().all()
+
+    existing_by_ext_ref = {c.external_ref: c for c in existing_classes if c.external_ref}
+    existing_by_name = {c.name.lower(): c for c in existing_classes}
+
+    created_classes = []
+    updated_classes = []
     class_id_map = {}
 
     for cls in parsed.get("classes", []):
@@ -118,22 +261,49 @@ async def import_board_xmi(
         if not c_name:
             continue
 
+        ext_ref = cls.get("external_ref")
         c_type_str = cls.get("element_type", "class").lower()
         c_type = ClassifierType.interface if c_type_str == "interface" else ClassifierType.class_
+        is_abs = cls.get("is_abstract", False)
 
-        class_elem = ClassElement(
-            package_id=package_id,
-            name=c_name,
-            element_type=c_type,
-            is_abstract=cls.get("is_abstract", False),
-        )
-        db.add(class_elem)
-        await db.flush()
+        # Determinar si ya existe
+        class_elem = None
+        if ext_ref and ext_ref in existing_by_ext_ref:
+            class_elem = existing_by_ext_ref[ext_ref]
+        elif c_name.lower() in existing_by_name:
+            class_elem = existing_by_name[c_name.lower()]
+
+        if class_elem:
+            # Actualización (Deduplicación activa)
+            class_elem.name = c_name
+            class_elem.element_type = c_type
+            class_elem.is_abstract = is_abs
+            if ext_ref and not class_elem.external_ref:
+                class_elem.external_ref = ext_ref
+            updated_classes.append(c_name)
+        else:
+            # Creación
+            class_elem = ClassElement(
+                package_id=package_id,
+                name=c_name,
+                element_type=c_type,
+                is_abstract=is_abs,
+                external_ref=ext_ref,
+            )
+            db.add(class_elem)
+            await db.flush()
+            created_classes.append(c_name)
 
         class_id_map[cls["id"]] = class_elem.id
         class_id_map[c_name] = class_elem.id
 
+        # Atributos: fusionar/actualizar
+        existing_attrs_stmt = select(Attribute).where(Attribute.class_id == class_elem.id)
+        existing_attrs_res = await db.execute(existing_attrs_stmt)
+        existing_attrs = {a.name.lower(): a for a in existing_attrs_res.scalars().all()}
+
         for idx, attr in enumerate(cls.get("attributes", [])):
+            a_name = attr.get("name", "attr")
             vis_str = attr.get("visibility", "public").lower()
             vis = VisibilityEnum.public
             if vis_str in ["private", "-"]:
@@ -143,28 +313,50 @@ async def import_board_xmi(
             elif vis_str in ["package", "~"]:
                 vis = VisibilityEnum.package
 
-            attr_elem = Attribute(
-                class_id=class_elem.id,
-                name=attr.get("name", "attr"),
-                data_type=attr.get("data_type", "VARCHAR"),
-                visibility=vis,
-                is_pkey=attr.get("is_pkey", False),
-                order_index=idx,
-            )
-            db.add(attr_elem)
+            a_dtype = attr.get("data_type", "VARCHAR")
+            a_pk = attr.get("is_pkey", False)
 
+            if a_name.lower() in existing_attrs:
+                existing_attr = existing_attrs[a_name.lower()]
+                existing_attr.data_type = a_dtype
+                existing_attr.visibility = vis
+                existing_attr.is_pkey = a_pk
+                existing_attr.order_index = idx
+            else:
+                new_attr = Attribute(
+                    class_id=class_elem.id,
+                    name=a_name,
+                    data_type=a_dtype,
+                    visibility=vis,
+                    is_pkey=a_pk,
+                    order_index=idx,
+                )
+                db.add(new_attr)
+
+        # Geometría visual en BoardElement
         pos = cls.get("position", {"x": 100.0, "y": 100.0})
-        be = BoardElement(
-            board_id=board_id,
-            class_id=class_elem.id,
-            x=pos.get("x", 100.0),
-            y=pos.get("y", 100.0),
-            width=pos.get("w", 220.0),
-            height=pos.get("h", 160.0),
+        be_stmt = select(BoardElement).where(
+            BoardElement.board_id == board_id,
+            BoardElement.class_id == class_elem.id
         )
-        db.add(be)
+        be_res = await db.execute(be_stmt)
+        be = be_res.scalar_one_or_none()
 
-        imported_classes.append(c_name)
+        if be:
+            be.x = pos.get("x", be.x)
+            be.y = pos.get("y", be.y)
+            be.width = pos.get("w", be.width or 220.0)
+            be.height = pos.get("h", be.height or 160.0)
+        else:
+            be = BoardElement(
+                board_id=board_id,
+                class_id=class_elem.id,
+                x=pos.get("x", 100.0),
+                y=pos.get("y", 100.0),
+                width=pos.get("w", 220.0),
+                height=pos.get("h", 160.0),
+            )
+            db.add(be)
 
     imported_associations = 0
     for assoc in parsed.get("associations", []):
@@ -187,20 +379,89 @@ async def import_board_xmi(
         elif "composition" in rel_type_str:
             assoc_type = AssociationType.composition
 
-        assoc_elem = Association(
-            source_class_id=src_id,
-            target_class_id=tgt_id,
-            type=assoc_type,
-            name=assoc.get("name"),
+        # Deduplicar asociación existente entre las mismas dos clases
+        existing_assoc_stmt = select(Association).where(
+            Association.source_class_id == src_id,
+            Association.target_class_id == tgt_id,
+            Association.type == assoc_type,
         )
-        db.add(assoc_elem)
+        existing_assoc_res = await db.execute(existing_assoc_stmt)
+        assoc_elem = existing_assoc_res.scalar_one_or_none()
+
+        if assoc_elem:
+            assoc_elem.name = assoc.get("name") or assoc_elem.name
+            assoc_elem.source_role = assoc.get("source_role") or assoc_elem.source_role
+            assoc_elem.target_role = assoc.get("target_role") or assoc_elem.target_role
+            assoc_elem.source_multiplicity = assoc.get("source_multiplicity") or assoc_elem.source_multiplicity
+            assoc_elem.target_multiplicity = assoc.get("target_multiplicity") or assoc_elem.target_multiplicity
+        else:
+            assoc_elem = Association(
+                source_class_id=src_id,
+                target_class_id=tgt_id,
+                type=assoc_type,
+                name=assoc.get("name"),
+                source_role=assoc.get("source_role"),
+                target_role=assoc.get("target_role"),
+                source_multiplicity=assoc.get("source_multiplicity"),
+                target_multiplicity=assoc.get("target_multiplicity"),
+            )
+            db.add(assoc_elem)
+
         imported_associations += 1
+
+    # Incrementar versión de tablero y registrar en board_history
+    new_version = (board.diagram_version or 0) + 1
+    board.diagram_version = new_version
+
+    history_entry = BoardHistory(
+        id=str(uuid.uuid4()),
+        board_id=board_id,
+        command_id=f"cmd-import-xmi-{uuid.uuid4()}",
+        command_type="IMPORT_XMI",
+        payload={
+            "filename": getattr(file, "filename", "imported.xmi"),
+            "created_count": len(created_classes),
+            "updated_count": len(updated_classes),
+            "associations_count": imported_associations,
+        },
+        actor_id=None,
+        actor_type=ActorTypeEnum.user,
+        model_version=new_version,
+    )
+    db.add(history_entry)
+
+    await db.flush()
+
+    # Guardar checkpoint de snapshot
+    normalized_state = await get_normalized_board_state(db, board_id)
+    if normalized_state:
+        snap = BoardSnapshot(
+            id=str(uuid.uuid4()),
+            board_id=board_id,
+            version=new_version,
+            snapshot=normalized_state,
+        )
+        db.add(snap)
 
     await db.commit()
 
-    return {
-        "status": "success",
-        "message": f"Se importaron {len(imported_classes)} clases y {imported_associations} relaciones.",
-        "classes": imported_classes,
-        "associations_count": imported_associations,
-    }
+    # Difusión en tiempo real por WebSocket a todos los peers conectados
+    if normalized_state:
+        try:
+            await manager.broadcast(
+                board_id,
+                {
+                    "type": "state:sync",
+                    "data": normalized_state,
+                },
+            )
+        except Exception:
+            pass
+
+    return XmiImportResponse(
+        status="success",
+        message=f"Se procesaron {len(created_classes) + len(updated_classes)} clases ({len(created_classes)} creadas, {len(updated_classes)} actualizadas) y {imported_associations} relaciones.",
+        classes=created_classes,
+        updated_classes=updated_classes,
+        associations_count=imported_associations,
+    )

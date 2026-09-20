@@ -4,8 +4,6 @@ Motor de Exportación e Importación de XMI 2.1 compatible con Enterprise Archit
 import uuid
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
-
 
 # ─── Mapeos de Tipos y Visibilidad ───────────────────────────────────────────
 
@@ -38,6 +36,39 @@ class XmiExporter:
     """
     Serializador a formato XMI 2.1 con extensiones visuales de Enterprise Architect.
     """
+
+    def _append_multiplicity(self, parent: ET.Element, mult_str: str, id_prefix: str) -> None:
+        if not mult_str:
+            return
+        mult = str(mult_str).strip()
+        if ".." in mult:
+            parts = mult.split("..", 1)
+            lower, upper = parts[0].strip(), parts[1].strip()
+        else:
+            lower = mult
+            upper = mult
+
+        if lower:
+            ET.SubElement(
+                parent,
+                "lowerValue",
+                {
+                    "xmi:type": "uml:LiteralInteger",
+                    "xmi:id": f"{id_prefix}_lower",
+                    "value": lower,
+                },
+            )
+        if upper:
+            u_type = "uml:LiteralUnlimitedNatural" if upper == "*" else "uml:LiteralInteger"
+            ET.SubElement(
+                parent,
+                "upperValue",
+                {
+                    "xmi:type": u_type,
+                    "xmi:id": f"{id_prefix}_upper",
+                    "value": upper,
+                },
+            )
 
     def export_board(
         self,
@@ -97,7 +128,8 @@ class XmiExporter:
         # 1. Clases e Interfaces
         for cls in classes:
             c_id = cls.get("id") or str(uuid.uuid4())
-            ea_class_id = _make_ea_id(c_id)
+            ext_ref = cls.get("external_ref")
+            ea_class_id = ext_ref if ext_ref else _make_ea_id(c_id)
             class_id_map[c_id] = ea_class_id
             class_id_map[cls.get("name", "")] = ea_class_id
 
@@ -120,7 +152,7 @@ class XmiExporter:
             for attr in cls.get("attributes", []):
                 attr_id = _make_ea_id(attr.get("id") or str(uuid.uuid4()))
                 vis = VISIBILITY_MAP_TO_UML.get(str(attr.get("visibility", "public")).lower(), "public")
-                
+
                 prop = ET.SubElement(
                     cls_elem,
                     "ownedAttribute",
@@ -131,10 +163,10 @@ class XmiExporter:
                         "visibility": vis,
                     },
                 )
-                
+
                 # Tipo primitivo o personalizado
                 dtype = attr.get("data_type") or attr.get("type") or "String"
-                type_ref = ET.SubElement(
+                ET.SubElement(
                     prop,
                     "type",
                     {
@@ -192,12 +224,12 @@ class XmiExporter:
                     },
                 )
                 # Ends
-                end1 = ET.SubElement(
+                ET.SubElement(
                     assoc_elem,
                     "memberEnd",
                     {"xmi:idref": f"{assoc_id}_src"},
                 )
-                end2 = ET.SubElement(
+                ET.SubElement(
                     assoc_elem,
                     "memberEnd",
                     {"xmi:idref": f"{assoc_id}_tgt"},
@@ -219,6 +251,13 @@ class XmiExporter:
                 elif rel_type.lower() == "composition":
                     oe1.set("aggregation", "composite")
 
+                src_role = assoc.get("source_role") or assoc.get("sourceRole")
+                if src_role:
+                    oe1.set("name", src_role)
+                src_mult = assoc.get("source_multiplicity") or assoc.get("sourceMultiplicity")
+                if src_mult:
+                    self._append_multiplicity(oe1, src_mult, f"{assoc_id}_src")
+
                 oe2 = ET.SubElement(
                     assoc_elem,
                     "ownedEnd",
@@ -229,6 +268,12 @@ class XmiExporter:
                         "association": assoc_id,
                     },
                 )
+                tgt_role = assoc.get("target_role") or assoc.get("targetRole")
+                if tgt_role:
+                    oe2.set("name", tgt_role)
+                tgt_mult = assoc.get("target_multiplicity") or assoc.get("targetMultiplicity")
+                if tgt_mult:
+                    self._append_multiplicity(oe2, tgt_mult, f"{assoc_id}_tgt")
 
         # 3. <xmi:Extension extender="Enterprise Architect"> (Diagram Layout & Coordinates)
         ext = ET.SubElement(
@@ -241,7 +286,7 @@ class XmiExporter:
         )
         diagrams_node = ET.SubElement(ext, "diagrams")
         diag_node = ET.SubElement(diagrams_node, "diagram", {"xmi:id": diag_id})
-        
+
         props_node = ET.SubElement(diag_node, "properties")
         props_node.set("name", board_name or "Class Diagram")
         props_node.set("type", "Logical")
@@ -263,7 +308,7 @@ class XmiExporter:
             bottom = int(py + h)
 
             geom_str = f"Left={left};Top={top};Right={right};Bottom={bottom};"
-            elem = ET.SubElement(
+            ET.SubElement(
                 elements_node,
                 "element",
                 {
@@ -284,11 +329,65 @@ class XmiImporter:
     Parser robusto para archivos XMI 2.1 / 2.x exportados desde Enterprise Architect u otras herramientas CASE.
     """
 
+    def _parse_multiplicity(self, end_elem: ET.Element) -> Optional[str]:
+        low = end_elem.find(".//lowerValue")
+        up = end_elem.find(".//upperValue")
+        low_val = low.attrib.get("value") if low is not None else None
+        up_val = up.attrib.get("value") if up is not None else None
+
+        if low_val is None and up_val is None:
+            low_val = end_elem.attrib.get("lower")
+            up_val = end_elem.attrib.get("upper")
+
+        if low_val is not None and up_val is not None:
+            if str(low_val) == str(up_val):
+                return str(low_val)
+            return f"{low_val}..{up_val}"
+        elif up_val is not None:
+            return str(up_val)
+        elif low_val is not None:
+            return str(low_val)
+        return None
+
+    def _parse_ea_geometry(self, geom: str) -> Optional[Dict[str, float]]:
+        """
+        Parsea un string de geometría EA: Left=100;Top=150;Right=320;Bottom=310;
+        """
+        try:
+            parts = [p.strip() for p in geom.split(";") if "=" in p]
+            kv = dict(p.split("=", 1) for p in parts)
+            left = float(kv.get("Left", 100))
+            top = float(kv.get("Top", 100))
+            right = float(kv.get("Right", left + 220))
+            bottom = float(kv.get("Bottom", top + 160))
+            return {
+                "x": left,
+                "y": top,
+                "w": max(right - left, 180.0),
+                "h": max(bottom - top, 120.0),
+            }
+        except Exception:
+            return None
+
     def parse(self, xml_content: str) -> Dict[str, Any]:
         """
         Parsea el contenido XML y retorna la estructura del modelo, clases, atributos, relaciones y posiciones visuales.
         """
-        root = ET.fromstring(xml_content)
+        if xml_content is None:
+            raise ValueError("El contenido XML no puede ser nulo.")
+
+        if len(xml_content.encode("utf-8")) > 10 * 1024 * 1024:
+            raise ValueError("El archivo XML excede el tamaño máximo permitido de 10 MB.")
+
+        upper_xml = xml_content.upper()
+        if "<!ENTITY" in upper_xml or "<!DOCTYPE" in upper_xml:
+            if "SYSTEM" in upper_xml or "PUBLIC" in upper_xml:
+                raise ValueError("Declaraciones DTD o entidades externas no están permitidas por seguridad.")
+
+        try:
+            root = ET.fromstring(xml_content)
+        except Exception as e:
+            raise ValueError(f"Estructura XML inválida o corrupta: {e}")
 
         # Namespaces handling: search regardless of prefix
         classes: List[Dict[str, Any]] = []
@@ -300,7 +399,6 @@ class XmiImporter:
             if elem.tag.endswith("element") and "geometry" in elem.attrib:
                 subject = elem.attrib.get("subject", "")
                 geom = elem.attrib.get("geometry", "")
-                # Parse Left=...;Top=...;Right=...;Bottom=...;
                 parsed_geo = self._parse_ea_geometry(geom)
                 if subject and parsed_geo:
                     positions[subject] = parsed_geo
@@ -327,7 +425,7 @@ class XmiImporter:
                         if not attr_name:
                             continue
                         vis = child.attrib.get("visibility", "public")
-                        
+
                         # Data type
                         dtype = "String"
                         type_tag = child.find(".//type")
@@ -353,6 +451,7 @@ class XmiImporter:
 
                 classes.append({
                     "id": elem_id,
+                    "external_ref": elem_id,
                     "name": name,
                     "element_type": classifier,
                     "is_abstract": is_abstract,
@@ -364,9 +463,6 @@ class XmiImporter:
             if elem.tag.endswith("generalization") or elem_type == "uml:Generalization":
                 src_cls = elem.attrib.get("specific") or elem.attrib.get("client")
                 tgt_cls = elem.attrib.get("general") or elem.attrib.get("supplier")
-                if not src_cls:
-                    # Find parent tag
-                    pass
                 if tgt_cls:
                     associations.append({
                         "id": elem_id,
@@ -389,16 +485,23 @@ class XmiImporter:
 
             # Association
             elif elem.tag.endswith("Association") or elem_type == "uml:Association":
-                member_ends = [m.attrib.get("xmi:idref") or m.attrib.get("idref") for m in elem.findall(".//memberEnd")]
                 owned_ends = elem.findall(".//ownedEnd")
-                
+
                 src_cls = None
                 tgt_cls = None
+                src_role = None
+                tgt_role = None
+                src_mult = None
+                tgt_mult = None
                 rel_type = "Association"
 
                 if len(owned_ends) >= 2:
                     src_cls = owned_ends[0].attrib.get("type")
                     tgt_cls = owned_ends[1].attrib.get("type")
+                    src_role = owned_ends[0].attrib.get("name")
+                    tgt_role = owned_ends[1].attrib.get("name")
+                    src_mult = self._parse_multiplicity(owned_ends[0])
+                    tgt_mult = self._parse_multiplicity(owned_ends[1])
                     agg = owned_ends[0].attrib.get("aggregation") or owned_ends[1].attrib.get("aggregation")
                     if agg == "shared":
                         rel_type = "Aggregation"
@@ -412,34 +515,13 @@ class XmiImporter:
                         "targetId": tgt_cls,
                         "type": rel_type,
                         "name": name or "",
+                        "source_role": src_role,
+                        "target_role": tgt_role,
+                        "source_multiplicity": src_mult,
+                        "target_multiplicity": tgt_mult,
                     })
-
-        # Match generalization parent if specific was missing
-        for cls in classes:
-            # Check nested generalizations
-            pass
 
         return {
             "classes": classes,
             "associations": associations,
         }
-
-    def _parse_ea_geometry(self, geom: str) -> Optional[Dict[str, float]]:
-        """
-        Parsea un string de geometría EA: Left=100;Top=150;Right=320;Bottom=310;
-        """
-        try:
-            parts = [p.strip() for p in geom.split(";") if "=" in p]
-            kv = dict(p.split("=", 1) for p in parts)
-            left = float(kv.get("Left", 100))
-            top = float(kv.get("Top", 100))
-            right = float(kv.get("Right", left + 220))
-            bottom = float(kv.get("Bottom", top + 160))
-            return {
-                "x": left,
-                "y": top,
-                "w": max(right - left, 180.0),
-                "h": max(bottom - top, 120.0),
-            }
-        except Exception:
-            return None

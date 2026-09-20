@@ -95,6 +95,7 @@ class ClassElement(Base):
     )
     # True = no tabla física; solo sus hijas concretas se mapean a @Entity
     is_abstract: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    external_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source: Mapped[ClassSource] = mapped_column(
         SAEnum(ClassSource, name="class_source"), default=ClassSource.manual, nullable=False
     )

@@ -13,6 +13,7 @@ class SchemaMapper:
             "name": c.name,
             "element_type": c.element_type.value if hasattr(c.element_type, "value") else str(c.element_type),
             "is_abstract": c.is_abstract,
+            "external_ref": getattr(c, "external_ref", None),
             "attributes": [
                 {
                     "id": a.id,
@@ -34,4 +35,8 @@ class SchemaMapper:
             "targetId": a.target_class_id,
             "type": a.type.value if hasattr(a.type, "value") else str(a.type),
             "name": a.name,
+            "source_role": a.source_role,
+            "target_role": a.target_role,
+            "source_multiplicity": a.source_multiplicity,
+            "target_multiplicity": a.target_multiplicity,
         }

@@ -1,4 +1,5 @@
 import logging
+import secrets
 from fastapi import APIRouter, WebSocket, Query, WebSocketDisconnect
 from app.core.websocket.manager import manager
 from app.modeling.diagram.dto.command_dto import Command
@@ -9,6 +10,8 @@ from app.modeling.diagram.service import board_service
 from app.modeling.diagram.service.relational_mutator_service import apply_command_to_relational_db
 from app.workspace.history.service.state_reconstructor_service import get_normalized_board_state
 from app.core.config import get_settings
+from app.core.security import decode_jwt_token
+from app.workspace.projects.service.project_authorization import check_board_access
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -157,40 +160,46 @@ async def websocket_endpoint(
     user_id: str | None = Query(None),
     token: str | None = Query(None),
 ):
-    from app.workspace.authentication.service import auth_service
-
     if not token:
-        await websocket.accept()
-        await websocket.send_json(
-            {"type": "error", "message": "Autenticación requerida para conectar al WebSocket"}
-        )
-        await websocket.close(code=4001)
-        return
+        # Si es un board demo o público, permitimos acceso como invitado
+        async with async_session_factory() as session:
+            has_access, role = await check_board_access(
+                session, board_id, "guest"
+            )
+        if has_access and role != "none":
+            actual_user_id = user_id or f"guest-{secrets.token_hex(4)}"
+        else:
+            await websocket.accept()
+            await websocket.send_json(
+                {"type": "error", "message": "Autenticación requerida para conectar al WebSocket"}
+            )
+            await websocket.close(code=4001)
+            return
+    else:
+        payload = decode_jwt_token(token)
+        if not payload or "sub" not in payload:
+            await websocket.accept()
+            await websocket.send_json(
+                {"type": "error", "message": "Token inválido o expirado"}
+            )
+            await websocket.close(code=4001)
+            return
 
-    payload = auth_service.decode_jwt_token(token)
-    if not payload or "sub" not in payload:
-        await websocket.accept()
-        await websocket.send_json(
-            {"type": "error", "message": "Token inválido o expirado"}
-        )
-        await websocket.close(code=4001)
-        return
+        actual_user_id = payload["sub"]
 
-    actual_user_id = payload["sub"]
+        # Verificar acceso y rol en el proyecto/board
+        async with async_session_factory() as session:
+            has_access, role = await check_board_access(
+                session, board_id, actual_user_id
+            )
 
-    # Verificar acceso y rol en el proyecto/board
-    async with async_session_factory() as session:
-        has_access, role = await auth_service.check_board_access(
-            session, board_id, actual_user_id
-        )
-
-    if not has_access or role == "none":
-        await websocket.accept()
-        await websocket.send_json(
-            {"type": "error", "message": "Acceso denegado al board"}
-        )
-        await websocket.close(code=4003)
-        return
+        if not has_access or role == "none":
+            await websocket.accept()
+            await websocket.send_json(
+                {"type": "error", "message": "Acceso denegado al board"}
+            )
+            await websocket.close(code=4003)
+            return
 
     await manager.connect(websocket, board_id, actual_user_id)
     handler = _get_handler(board_id)

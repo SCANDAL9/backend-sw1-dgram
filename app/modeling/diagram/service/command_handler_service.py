@@ -1,3 +1,4 @@
+import uuid
 from app.modeling.diagram.dto.command_dto import Command
 from app.modeling.diagram.dto.command_dto import CommandResult
 from app.modeling.diagram.service.entity_applier_service import apply_entity_command
@@ -9,6 +10,7 @@ ENTITY_COMMANDS = {
     "ADD_COLUMN", "UPDATE_COLUMN", "DELETE_COLUMN",
     "CREATE_CLASS", "DELETE_CLASS", "UPDATE_CLASS", "MOVE_CLASS",
     "ADD_ATTRIBUTE", "UPDATE_ATTRIBUTE", "DELETE_ATTRIBUTE",
+    "RESIZE_ENTITY", "RESIZE_CLASS", "ASSIGN_CLASS_PACKAGE",
 }
 
 RELATION_COMMANDS = {
@@ -17,12 +19,17 @@ RELATION_COMMANDS = {
     "LINK_ASSOCIATION_CLASS", "UNLINK_ASSOCIATION_CLASS",
 }
 
+PACKAGE_COMMANDS = {
+    "CREATE_PACKAGE", "UPDATE_PACKAGE", "DELETE_PACKAGE",
+}
+
 # Map UML → ER para normalizar payload antes de aplicar
 _ENTITY_ALIAS = {
     "CREATE_CLASS": "CREATE_ENTITY", "DELETE_CLASS": "DELETE_ENTITY",
     "UPDATE_CLASS": "UPDATE_ENTITY", "MOVE_CLASS": "MOVE_ENTITY",
     "ADD_ATTRIBUTE": "ADD_COLUMN", "UPDATE_ATTRIBUTE": "UPDATE_COLUMN",
     "DELETE_ATTRIBUTE": "DELETE_COLUMN",
+    "RESIZE_CLASS": "RESIZE_ENTITY",
 }
 _RELATION_ALIAS = {
     "CREATE_ASSOCIATION": "CREATE_RELATION", "UPDATE_ASSOCIATION": "UPDATE_RELATION",
@@ -64,6 +71,7 @@ class CommandHandler:
         self.version = 0
         self.entities: dict = {}
         self.relations: dict = {}
+        self.packages: dict = {}
 
     async def execute(self, command: Command) -> CommandResult:
         try:
@@ -100,6 +108,10 @@ class CommandHandler:
             payload["source_entity_id"] = payload["source_class_id"]
         if payload.get("target_class_id") and not payload.get("target_entity_id"):
             payload["target_entity_id"] = payload["target_class_id"]
+        if payload.get("source_id") and not payload.get("source_entity_id"):
+            payload["source_entity_id"] = payload["source_id"]
+        if payload.get("target_id") and not payload.get("target_entity_id"):
+            payload["target_entity_id"] = payload["target_id"]
         if payload.get("association_type") and not payload.get("relation_type"):
             payload["relation_type"] = payload["association_type"]
         if payload.get("source_attribute") and not payload.get("source_column"):
@@ -111,7 +123,7 @@ class CommandHandler:
         return payload
 
     def _apply(self, command: Command) -> None:
-        raw_type = command.command_type.value
+        raw_type = command.command_type.value if hasattr(command.command_type, "value") else str(command.command_type)
         cmd_type = _ENTITY_ALIAS.get(raw_type, _RELATION_ALIAS.get(raw_type, raw_type))
         payload = self._normalize_payload(command.payload.model_dump())
 
@@ -120,11 +132,14 @@ class CommandHandler:
 
         if raw_type in RELATION_COMMANDS or cmd_type in RELATION_COMMANDS:
             if cmd_type == "CREATE_RELATION":
+                src = payload.get("source_entity_id")
+                tgt = payload.get("target_entity_id")
+                if not src or not tgt or src not in self.entities or tgt not in self.entities:
+                    raise ValueError(f"Cannot create relation: endpoints '{src}' and '{tgt}' must both exist as entities")
+
                 rel_type = str(payload.get("relation_type", "")).lower()
                 if any(gt in rel_type for gt in ("generalization", "realization", "inheritance")):
-                    src = payload.get("source_entity_id")
-                    tgt = payload.get("target_entity_id")
-                    if src and tgt and check_generalization_cycle(self.relations, src, tgt):
+                    if check_generalization_cycle(self.relations, src, tgt):
                         raise ValueError(f"Cyclic inheritance detected: '{src}' cannot inherit from '{tgt}'")
 
             elif cmd_type == "UPDATE_RELATION":
@@ -139,6 +154,26 @@ class CommandHandler:
                             raise ValueError(f"Cyclic inheritance detected: '{src}' cannot inherit from '{tgt}'")
 
             apply_relation_command(self.relations, cmd_type, payload)
+
+        if raw_type in PACKAGE_COMMANDS:
+            if raw_type == "CREATE_PACKAGE":
+                pkg_id = payload.get("package_id") or payload.get("id") or str(uuid.uuid4())
+                self.packages[pkg_id] = {
+                    "id": pkg_id,
+                    "name": payload.get("package_name") or payload.get("name") or "Nuevo Paquete",
+                }
+            elif raw_type == "UPDATE_PACKAGE":
+                pkg_id = payload.get("package_id") or payload.get("id")
+                if pkg_id in self.packages:
+                    new_name = payload.get("package_name") or payload.get("name")
+                    if new_name:
+                        self.packages[pkg_id]["name"] = new_name
+            elif raw_type == "DELETE_PACKAGE":
+                pkg_id = payload.get("package_id") or payload.get("id")
+                self.packages.pop(pkg_id, None)
+                for e in self.entities.values():
+                    if e.get("package_id") == pkg_id:
+                        e["package_id"] = "default"
 
         if cmd_type == "DELETE_ENTITY":
             eid = payload.get("entity_id") or command.payload.entity_id or command.payload.class_id
@@ -173,6 +208,7 @@ class CommandHandler:
     async def _rebuild(self) -> None:
         self.entities.clear()
         self.relations.clear()
+        self.packages.clear()
         self.version = 0
         for cmd in await self.history.get_all(upto_pointer=True):
             self._apply(cmd)
@@ -186,20 +222,32 @@ class CommandHandler:
                 "id": e.get("id"),
                 "name": e.get("name"),
                 "attributes": columns,
-                # keep both for compat
                 "columns": columns,
                 "position": e.get("position", {"x": 100, "y": 100}),
+                "width": e.get("width"),
+                "height": e.get("height"),
+                "package_id": e.get("package_id"),
+                "packageId": e.get("package_id"),
+                "element_type": e.get("element_type", "class"),
+                "elementType": e.get("element_type", "class"),
+                "is_abstract": bool(e.get("is_abstract", False)),
+                "isAbstract": bool(e.get("is_abstract", False)),
             })
 
         relations = []
         for r in self.relations.values():
             relations.append({
                 "id": r.get("id"),
+                "name": r.get("name"),
                 "sourceId": r.get("source_id"),
                 "targetId": r.get("target_id"),
                 "type": r.get("type", "1:N"),
                 "sourceColumn": r.get("source_column", ""),
                 "targetColumn": r.get("target_column", ""),
+                "sourceRole": r.get("source_role"),
+                "targetRole": r.get("target_role"),
+                "sourceMultiplicity": r.get("source_multiplicity"),
+                "targetMultiplicity": r.get("target_multiplicity"),
                 # UML aliases
                 "sourceClassId": r.get("source_id"),
                 "targetClassId": r.get("target_id"),
@@ -211,9 +259,9 @@ class CommandHandler:
         return {
             "entities": entities,
             "relations": relations,
-            # UML aliases for forward compat
             "classes": entities,
             "associations": relations,
+            "packages": list(self.packages.values()),
             "version": self.version,
         }
 
@@ -221,6 +269,17 @@ class CommandHandler:
         """Populate in-memory stores from a persisted camelCase snapshot. Accepts entities/classes, relations/associations."""
         self.entities = {}
         self.relations = {}
+        self.packages = {}
+
+        raw_packages = state.get("packages", [])
+        if isinstance(raw_packages, list):
+            for p in raw_packages:
+                if isinstance(p, dict) and "id" in p:
+                    self.packages[p["id"]] = {
+                        "id": p["id"],
+                        "name": p.get("name", "Paquete"),
+                    }
+
         raw_entities = state.get("entities", []) or state.get("classes", [])
         raw_relations = state.get("relations", []) or state.get("associations", [])
         for index, e in enumerate(raw_entities):
@@ -228,17 +287,28 @@ class CommandHandler:
             self.entities[eid] = {
                 "id": eid,
                 "name": e.get("name", ""),
-                "columns": e.get("attributes", []) or e.get("columns", []) or e.get("attributes", []),
+                "columns": e.get("attributes", []) or e.get("columns", []) or [],
                 "position": e.get("position", {"x": 100, "y": 100}),
+                "width": e.get("width"),
+                "height": e.get("height"),
+                "package_id": e.get("package_id") or e.get("packageId"),
+                "element_type": e.get("element_type") or e.get("elementType", "class"),
+                "is_abstract": bool(e.get("is_abstract") or e.get("isAbstract", False)),
             }
         for index, r in enumerate(raw_relations):
             rid = r.get("id") or f"rel-{index + 1}"
             self.relations[rid] = {
                 "id": rid,
+                "name": r.get("name"),
                 "source_id": r.get("sourceId") or r.get("sourceClassId") or r.get("source_id"),
                 "target_id": r.get("targetId") or r.get("targetClassId") or r.get("target_id"),
                 "type": r.get("type", "1:N"),
                 "source_column": r.get("sourceColumn") or r.get("sourceAttribute") or r.get("source_column") or "",
                 "target_column": r.get("targetColumn") or r.get("targetAttribute") or r.get("target_column") or "",
+                "source_role": r.get("sourceRole") or r.get("source_role"),
+                "target_role": r.get("targetRole") or r.get("target_role"),
+                "source_multiplicity": r.get("sourceMultiplicity") or r.get("source_multiplicity"),
+                "target_multiplicity": r.get("targetMultiplicity") or r.get("target_multiplicity"),
+                "association_class_id": r.get("associationClassId") or r.get("association_class_id"),
             }
         self.version = int(state.get("version", 0))

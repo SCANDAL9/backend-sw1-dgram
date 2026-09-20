@@ -12,6 +12,7 @@ from app.modeling.ai.controller.chat_controller import router as chat_router
 from app.modeling.ai.controller.guide_controller import router as guide_router
 from app.generation.schema.controller.xmi_controller import router as xmi_router
 from app.generation.code.controller.codegen_controller import router as codegen_router
+from app.workspace.history.controller.history_controller import router as history_router
 from app.core.websocket.handlers import router as ws_router
 
 
@@ -61,6 +62,7 @@ app.include_router(xmi_router, prefix="/api", tags=["xmi"])
 app.include_router(codegen_router, prefix="/api/codegen", tags=["codegen"])
 app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
 app.include_router(guide_router, prefix="/api/guide", tags=["guide"])
+app.include_router(history_router, prefix="/api", tags=["history"])
 app.include_router(ws_router, tags=["websocket"])
 
 

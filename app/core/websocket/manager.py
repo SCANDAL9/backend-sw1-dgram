@@ -66,6 +66,32 @@ class ConnectionManager:
                     {"type": "user:left", "data": {"user_id": user_id}},
                 )
 
+    async def kick_local(self, board_id: str, user_id: str, reason: str = "Acceso revocado") -> None:
+        """Desconecta a un usuario expulsado en esta réplica local cerrando su WebSocket con 4003."""
+        ws = self.rooms.get(board_id, {}).get(user_id)
+        if ws:
+            try:
+                await ws.send_json({"type": "error", "message": reason})
+                await ws.close(code=4003)
+            except Exception as exc:
+                logger.debug("Error cerrando socket de usuario expulsado %s: %s", user_id, exc)
+            await self.disconnect(board_id, user_id)
+
+    async def kick_user(self, board_id: str, user_id: str, reason: str = "Acceso revocado") -> None:
+        """Expulsa a un usuario tanto localmente como difundiendo la orden por Redis a las demás réplicas."""
+        await self.kick_local(board_id, user_id, reason)
+        try:
+            redis_msg = {
+                "type": "member:kicked",
+                "board_id": board_id,
+                "user_id": user_id,
+                "reason": reason,
+                "_replica_id": REPLICA_ID,
+            }
+            await pubsub.publish(f"board:{board_id}", redis_msg)
+        except Exception as exc:
+            logger.warning("Fallo al publicar member:kicked en Redis para board %s: %s", board_id, exc)
+
     async def broadcast(
         self, board_id: str, message: dict, exclude_user: str | None = None
     ) -> None:
