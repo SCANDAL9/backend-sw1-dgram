@@ -123,11 +123,12 @@ class AgentOrchestrator:
 
         # 1. Obtener o crear conversación de chat
         conv = await get_or_create_conversation(db, board_id, user_id)
+        conv_id = str(conv.id)
 
         # Guardar mensaje del usuario
         user_msg = ChatMessage(
             id=str(uuid.uuid4()),
-            conversation_id=conv.id,
+            conversation_id=conv_id,
             sender_type=ActorTypeEnum.user,
             user_id=user_id,
             content_text=user_prompt,
@@ -161,7 +162,7 @@ class AgentOrchestrator:
         # 4. Guardar respuesta del agente en ChatMessage
         ai_msg = ChatMessage(
             id=str(uuid.uuid4()),
-            conversation_id=conv.id,
+            conversation_id=conv_id,
             sender_type=ActorTypeEnum.ai,
             user_id=None,
             content_text=run_result.reply_text,

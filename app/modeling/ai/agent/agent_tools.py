@@ -206,9 +206,11 @@ async def tool_get_diagram_summary(
 async def tool_execute_diagram_command(
     db: AsyncSession,
     board_id: str,
-    command_type: str,
-    payload_dict: dict[str, Any],
-    actor: str = "ai:adk-agent",
+    command_type: str | CommandType,
+    payload: dict[str, Any] | None = None,
+    payload_dict: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    actor: str | None = None,
 ) -> CommandExecutionResult:
     """
     Tool de mutación: Pasa rigurosamente por el Command Protocol y CommandHandler.
@@ -220,13 +222,16 @@ async def tool_execute_diagram_command(
     from app.modeling.diagram.service.relational_mutator_service import apply_command_to_relational_db
     from app.modeling.diagram.service import board_service
 
-    cmd_type_enum = CommandType(command_type)
-    cmd_payload = CommandPayload(**payload_dict)
+    cmd_type_enum = CommandType(command_type) if isinstance(command_type, str) else command_type
+    effective_payload = payload if payload is not None else (payload_dict or {})
+    cmd_payload = CommandPayload(**effective_payload)
+
+    effective_actor = actor or (f"user:{user_id}" if user_id else "ai:adk-agent")
 
     cmd = Command(
         command_type=cmd_type_enum,
         payload=cmd_payload,
-        actor=actor,
+        actor=effective_actor,
     )
 
     history = CommandHistory(board_id)

@@ -109,6 +109,45 @@ ADK_TOOLS_DECLARATIONS = [
                 },
             },
             {
+                "name": "create_package",
+                "description": "Crea un paquete contenedor UML en el proyecto.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {
+                            "type": "STRING",
+                            "description": "Nombre del paquete (ej. Domain, Auth, Billing)",
+                        }
+                    },
+                    "required": ["name"],
+                },
+            },
+            {
+                "name": "assign_package",
+                "description": "Asigna una entidad o clase a un paquete contenedor.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "entity_id": {"type": "STRING", "description": "ID de la clase"},
+                        "package_id": {"type": "STRING", "description": "ID del paquete destino"},
+                    },
+                    "required": ["entity_id", "package_id"],
+                },
+            },
+            {
+                "name": "resize_entity",
+                "description": "Ajusta el ancho y alto dimensional de una entidad en el lienzo.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "entity_id": {"type": "STRING", "description": "ID de la clase"},
+                        "width": {"type": "NUMBER", "description": "Nuevo ancho (min 150)"},
+                        "height": {"type": "NUMBER", "description": "Nuevo alto (min 100)"},
+                    },
+                    "required": ["entity_id", "width", "height"],
+                },
+            },
+            {
                 "name": "emit_ui_action",
                 "description": "Emite una acción visual a la interfaz de usuario del cliente web (resaltar nodo, enfocar elemento o abrir panel).",
                 "parameters": {
@@ -212,6 +251,46 @@ class ADKAgentRunner:
                 )
                 output_dict = action_res.model_dump()
 
+
+            elif tool_name == "create_package":
+                res = await tool_execute_diagram_command(
+                    db=db,
+                    board_id=board_id,
+                    user_id=user_id,
+                    command_type=CommandType.CREATE_PACKAGE,
+                    payload={"name": tool_args.get("name", "NuevoPaquete")},
+                )
+                cmd_result = res
+                output_dict = res.model_dump()
+
+            elif tool_name == "assign_package":
+                res = await tool_execute_diagram_command(
+                    db=db,
+                    board_id=board_id,
+                    user_id=user_id,
+                    command_type=CommandType.ASSIGN_CLASS_PACKAGE,
+                    payload={
+                        "entity_id": tool_args.get("entity_id"),
+                        "package_id": tool_args.get("package_id"),
+                    },
+                )
+                cmd_result = res
+                output_dict = res.model_dump()
+
+            elif tool_name == "resize_entity":
+                res = await tool_execute_diagram_command(
+                    db=db,
+                    board_id=board_id,
+                    user_id=user_id,
+                    command_type=CommandType.RESIZE_ENTITY,
+                    payload={
+                        "entity_id": tool_args.get("entity_id"),
+                        "width": tool_args.get("width", 200),
+                        "height": tool_args.get("height", 160),
+                    },
+                )
+                cmd_result = res
+                output_dict = res.model_dump()
 
             # Compatibilidad directa si Gemini invoca nombres canónicos anteriores:
             elif tool_name == "create_class":
@@ -572,6 +651,49 @@ class ADKAgentRunner:
                 traces=traces,
                 commands_executed=commands_executed,
             )
+
+        # 5. Creación de paquete
+        pkg_match = re.search(r"(?:crea|agrega|añade|nuevo)\s+(?:un\s+)?paquete\s+([a-zA-Z0-9_]+)", prompt_lower)
+        if pkg_match:
+            pname = pkg_match.group(1)
+            out, tr, cmd_res = await self.execute_tool(
+                tool_name="create_package",
+                tool_args={"name": pname},
+                db=db,
+                board_id=board_id,
+                user_id=user_id,
+            )
+            traces.append(tr)
+            if cmd_res:
+                commands_executed.append(cmd_res)
+            return AgentRunResult(
+                agent_name=self.agent_name,
+                reply_text=f"He creado el paquete '{pname}' con éxito.",
+                traces=traces,
+                commands_executed=commands_executed,
+            )
+
+        # 6. Redimensionar entidad
+        resize_match = re.search(r"(?:redimensiona|ajusta tamaño de|cambia tamaño de)\s+([a-zA-Z0-9_]+)", prompt_lower)
+        if resize_match:
+            ename = resize_match.group(1)
+            out, tr, cmd_res = await self.execute_tool(
+                tool_name="resize_entity",
+                tool_args={"entity_id": ename, "width": 260, "height": 180},
+                db=db,
+                board_id=board_id,
+                user_id=user_id,
+            )
+            traces.append(tr)
+            if cmd_res:
+                commands_executed.append(cmd_res)
+            return AgentRunResult(
+                agent_name=self.agent_name,
+                reply_text=f"He redimensionado la entidad '{ename}' a 260x180.",
+                traces=traces,
+                commands_executed=commands_executed,
+            )
+
 
         return AgentRunResult(
             agent_name=self.agent_name,

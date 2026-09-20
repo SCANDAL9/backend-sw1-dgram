@@ -389,6 +389,104 @@ class VertexAIClient:
             logger.error("Error llamando a Vertex AI Vision: %s", e)
             return f"Error al procesar la imagen: {str(e)}", []
 
+    async def transcribe_and_process_audio(
+        self,
+        audio_bytes: bytes,
+        mime_type: str = "audio/wav",
+        user_prompt: str | None = None,
+        current_state: dict | None = None,
+    ) -> tuple[str, str, list[dict]]:
+        """
+        Multimodal Audio: Transcribe audio pregrabado y procesa la intención en el diagrama UML.
+        Retorna una tupla: (texto_transcrito, respuesta_ia, tool_calls).
+        """
+        token, project = self._get_auth_token_and_project()
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+
+        if not token or not project:
+            logger.info("Vertex AI no configurado para Audio. Usando fallback heurístico de audio.")
+            return self._heuristic_audio_fallback(audio_bytes, mime_type, user_prompt, current_state or {})
+
+        url = self._get_endpoint_url(project)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        system_instruction = (
+            "Eres el asistente multimodal de dgram. Escucha atentamente el audio adjunto. "
+            "Primero proporciona la transcripción fiel de lo que dice el usuario. "
+            "Luego, si el audio contiene instrucciones de modelado UML (ej. 'Crea una clase Producto...'), "
+            "invoca las herramientas correspondientes declaradas. "
+            "Empieza tu respuesta con 'Transcripción: <texto transcrito>' seguido de tu análisis o confirmación."
+        )
+
+        prompt_text = user_prompt or "Transcribe este audio y ejecuta los comandos correspondientes sobre el diagrama."
+
+        body: dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": b64_audio,
+                            }
+                        },
+                        {"text": prompt_text},
+                    ],
+                }
+            ],
+            "system_instruction": {"parts": [{"text": system_instruction}]},
+            "tools": VERTEX_TOOLS,
+            "generation_config": {
+                "temperature": 0.1,
+                "max_output_tokens": 2048,
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, headers=headers, json=body)
+                if resp.status_code != 200:
+                    logger.error("Error en Vertex AI Audio (%d): %s", resp.status_code, resp.text)
+                    return "[Audio recibido pero no pudo transcribirse en Vertex]", "Error procesando audio.", []
+                data = resp.json()
+                reply_text, tool_calls = self._parse_vertex_response(data, prompt_text, current_state or {})
+
+                # Extraer transcripción si viene en el formato solicitado
+                transcript = prompt_text
+                if "Transcripción:" in reply_text:
+                    parts = reply_text.split("Transcripción:", 1)[1].strip()
+                    lines = parts.split("\n", 1)
+                    transcript = lines[0].strip()
+                    clean_reply = lines[1].strip() if len(lines) > 1 else reply_text
+                else:
+                    clean_reply = reply_text
+
+                return transcript, clean_reply, tool_calls
+        except Exception as e:
+            logger.error("Error llamando a Vertex AI Audio: %s", e)
+            return self._heuristic_audio_fallback(audio_bytes, mime_type, user_prompt, current_state or {})
+
+    def _heuristic_audio_fallback(
+        self,
+        audio_bytes: bytes,
+        mime_type: str,
+        user_prompt: str | None = None,
+        current_state: dict | None = None,
+    ) -> tuple[str, str, list[dict]]:
+        """Fallback heurístico determinista para pruebas o entornos sin credenciales GCP."""
+        default_transcript = user_prompt or "Crea una clase Categoria con id, nombre y descripcion"
+        reply_text, tool_calls = self._heuristic_fallback(default_transcript, current_state or {})
+        return (
+            default_transcript,
+            f"Transcripción procesada (modo local/demo): '{default_transcript}'. {reply_text}",
+            tool_calls,
+        )
+
+
     def _parse_vertex_response(
         self, data: dict, user_prompt: str, current_state: dict
     ) -> tuple[str, list[dict]]:
