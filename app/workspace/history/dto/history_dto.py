@@ -15,10 +15,28 @@ class HistoryItemDTO(BaseModel):
     actor_type: str | None = None
     model_version: int | None = None
     created_at: str | None = None
+    summary: str | None = None
+    target_name: str | None = None
 
 
 class TimelineFilterDTO(BaseModel):
     actor_id: str | None = None
+    actor_type: str | None = None
     command_type: str | None = None
     from_version: int | None = None
     to_version: int | None = None
+    limit: int = 50
+    offset: int = 0
+
+
+class HistoryDetailDTO(BaseModel):
+    entry: HistoryItemDTO
+    diff: dict[str, Any] = {}
+
+
+class RestoreVersionResponseDTO(BaseModel):
+    success: bool
+    restored_version: int
+    new_diagram_version: int
+    message: str
+

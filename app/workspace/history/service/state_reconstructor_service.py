@@ -11,7 +11,9 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.modeling.diagram.entity.board_entity import Board
-from app.modeling.diagram.entity.uml_entity import ClassElement, Attribute, Association, AssociationType, AssociationClassLink
+from app.modeling.diagram.entity.uml_entity import (
+    ClassElement, Attribute, Association, AssociationType, AssociationClassLink, Package
+)
 from app.modeling.diagram.entity.board_normalized_entity import BoardElement, BoardSnapshot
 
 
@@ -64,6 +66,17 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             return snap.state
         return None
 
+    packages_list = []
+    if board.project_id:
+        pkg_stmt = select(Package).where(Package.project_id == board.project_id)
+        pkg_res = await db.execute(pkg_stmt)
+        for p in pkg_res.scalars().all():
+            packages_list.append({
+                "id": p.id,
+                "name": p.name,
+                "project_id": p.project_id,
+            })
+
     elem_stmt = (
         select(BoardElement, ClassElement)
         .join(ClassElement, BoardElement.class_id == ClassElement.id)
@@ -73,7 +86,14 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
     elem_rows = elem_res.all()
 
     if not elem_rows:
-        return None
+        return {
+            "version": board.diagram_version or 1,
+            "entities": [],
+            "relations": [],
+            "classes": [],
+            "associations": [],
+            "packages": packages_list,
+        }
 
     entities = []
     classes = []
@@ -116,16 +136,22 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             for a in attrs
         ]
 
-
         pos_x = getattr(be, "x", getattr(be, "pos_x", 100.0))
         pos_y = getattr(be, "y", getattr(be, "pos_y", 100.0))
+        w = getattr(be, "width", None)
+        h = getattr(be, "height", None)
 
         entities.append({
             "id": ce.id,
             "name": ce.name,
             "position": {"x": float(pos_x), "y": float(pos_y)},
+            "width": float(w) if w is not None else None,
+            "height": float(h) if h is not None else None,
             "columns": columns,
             "attributes": attributes_list,
+            "package_id": ce.package_id,
+            "element_type": ce.element_type.value if hasattr(ce.element_type, "value") else str(ce.element_type),
+            "is_abstract": bool(ce.is_abstract),
         })
 
         classes.append({
@@ -136,7 +162,6 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             "element_type": ce.element_type.value if hasattr(ce.element_type, "value") else str(ce.element_type),
             "attributes": attributes_list,
         })
-
 
     relations = []
     associations = []
@@ -149,6 +174,14 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
         assoc_res = await db.execute(assoc_stmt)
         assoc_rows = assoc_res.scalars().all()
 
+        links = {}
+        if assoc_rows:
+            link_stmt = select(AssociationClassLink).where(
+                AssociationClassLink.association_id.in_([a.id for a in assoc_rows])
+            )
+            link_res = await db.execute(link_stmt)
+            links = {l.association_id: l.class_id for l in link_res.scalars().all()}
+
         for asc in assoc_rows:
             card_map = {
                 "one_to_one": "1:1",
@@ -158,13 +191,22 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
                 "1:n": "1:n",
                 "n:m": "n:m",
             }
-            rel_type = card_map.get(str(asc.cardinality).lower(), "1:n")
+            card_val = getattr(asc, "cardinality", getattr(asc, "target_multiplicity", "1:n"))
+            rel_type = card_map.get(str(card_val).lower(), "1:n")
+            assoc_class_link_id = links.get(asc.id)
 
             relations.append({
                 "id": asc.id,
                 "source_id": asc.source_class_id,
                 "target_id": asc.target_class_id,
                 "type": rel_type,
+                "name": asc.name,
+                "source_role": asc.source_role,
+                "target_role": asc.target_role,
+                "source_multiplicity": asc.source_multiplicity,
+                "target_multiplicity": asc.target_multiplicity,
+                "association_class_id": assoc_class_link_id,
+                "associationClassId": assoc_class_link_id,
             })
 
             associations.append({
@@ -175,10 +217,12 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
                 "target_class_id": asc.target_class_id,
                 "source_role": asc.source_role,
                 "target_role": asc.target_role,
-                "source_cardinality": asc.source_cardinality,
-                "target_cardinality": asc.target_cardinality,
-                "cardinality": asc.cardinality,
-                "is_association_class": bool(asc.is_association_class),
+                "source_cardinality": getattr(asc, "source_cardinality", asc.source_multiplicity),
+                "target_cardinality": getattr(asc, "target_cardinality", asc.target_multiplicity),
+                "cardinality": getattr(asc, "cardinality", asc.target_multiplicity),
+                "is_association_class": bool(getattr(asc, "is_association_class", False) or assoc_class_link_id is not None),
+                "association_class_id": assoc_class_link_id,
+                "associationClassId": assoc_class_link_id,
             })
 
     return {
@@ -187,4 +231,5 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
         "relations": relations,
         "classes": classes,
         "associations": associations,
+        "packages": packages_list,
     }
