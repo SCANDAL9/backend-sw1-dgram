@@ -194,9 +194,13 @@ async def websocket_endpoint(
             )
 
         if not has_access or role == "none":
+            logger.warning(
+                "[WebSocket] Acceso denegado a board %s para user %s (role=%s)",
+                board_id, actual_user_id, role
+            )
             await websocket.accept()
             await websocket.send_json(
-                {"type": "error", "message": "Acceso denegado al board"}
+                {"type": "error", "message": f"Acceso denegado al board {board_id}"}
             )
             await websocket.close(code=4003)
             return

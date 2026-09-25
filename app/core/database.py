@@ -16,6 +16,19 @@ class Base(DeclarativeBase):
     pass
 
 
+def load_all_models() -> None:
+    """Eagerly register all entity classes in Base.metadata for foreign key resolution."""
+    import app.workspace.authentication.entity.user_entity  # noqa: F401
+    import app.workspace.projects.entity.project_entity  # noqa: F401
+    import app.modeling.diagram.entity.board_entity  # noqa: F401
+    import app.modeling.diagram.entity.uml_entity  # noqa: F401
+    import app.modeling.diagram.entity.board_normalized_entity  # noqa: F401
+    import app.modeling.ai.entity.chat_entity  # noqa: F401
+
+
+load_all_models()
+
+
 async def get_db() -> AsyncSession:
     async with async_session_factory() as session:
         try:
@@ -36,6 +49,7 @@ async def init_db() -> None:
             "ALTER TABLE class_element ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'manual';",
             "ALTER TABLE class_element ADD COLUMN IF NOT EXISTS created_by VARCHAR(36);",
             "ALTER TABLE class_element ADD COLUMN IF NOT EXISTS is_abstract BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE class_element ADD COLUMN IF NOT EXISTS is_visible BOOLEAN DEFAULT TRUE;",
             "ALTER TABLE attribute ADD COLUMN IF NOT EXISTS is_pkey BOOLEAN DEFAULT FALSE;",
             "ALTER TABLE attribute ADD COLUMN IF NOT EXISTS is_fkey BOOLEAN DEFAULT FALSE;",
             "ALTER TABLE attribute ADD COLUMN IF NOT EXISTS is_derived BOOLEAN DEFAULT FALSE;",
@@ -46,6 +60,8 @@ async def init_db() -> None:
             "ALTER TABLE association ADD COLUMN IF NOT EXISTS source_multiplicity VARCHAR(20);",
             "ALTER TABLE association ADD COLUMN IF NOT EXISTS target_multiplicity VARCHAR(20);",
             "ALTER TABLE boards ADD COLUMN IF NOT EXISTS yjs_state BYTEA;",
+            "ALTER TABLE chat_conversation DROP COLUMN IF EXISTS title;",
+            "ALTER TABLE chat_conversation DROP COLUMN IF EXISTS updated_at;",
         ]
         for sql in schema_updates:
             try:
