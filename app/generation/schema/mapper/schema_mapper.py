@@ -11,8 +11,10 @@ class SchemaMapper:
         return {
             "id": c.id,
             "name": c.name,
+            "package_id": getattr(c, "package_id", None),
             "element_type": c.element_type.value if hasattr(c.element_type, "value") else str(c.element_type),
             "is_abstract": c.is_abstract,
+            "is_visible": getattr(c, "is_visible", True),
             "external_ref": getattr(c, "external_ref", None),
             "attributes": [
                 {

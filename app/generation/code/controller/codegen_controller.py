@@ -97,11 +97,16 @@ async def generate_code_for_board(
         files = service.generate_files(state)
 
         # Registro de trazabilidad y auditoría en BoardHistory
+        actor_id = (
+            auth_ctx.user.id
+            if auth_ctx.user and auth_ctx.user.id and not str(auth_ctx.user.id).startswith("guest")
+            else None
+        )
         history_entry = BoardHistory(
             id=str(uuid.uuid4()),
             board_id=board_id,
             command_id=f"cmd-codegen-{uuid.uuid4()}",
-            actor_id=auth_ctx.user.id if auth_ctx.user else None,
+            actor_id=actor_id,
             command_type="GENERATE_CODE",
             payload={"base_package": base_package, "files_count": len(files)},
             actor_type=ActorTypeEnum.user,
@@ -142,11 +147,16 @@ async def download_code_zip(
     zip_bytes = service.generate_zip(state)
 
     # Registro de auditoría de descarga
+    actor_id = (
+        current_user.id
+        if current_user and current_user.id and not str(current_user.id).startswith("guest")
+        else None
+    )
     history_entry = BoardHistory(
         id=str(uuid.uuid4()),
         board_id=board_id,
         command_id=f"cmd-download-{uuid.uuid4()}",
-        actor_id=current_user.id if current_user else None,
+        actor_id=actor_id,
         command_type="GENERATE_CODE",
         payload={"action": "download_zip", "base_package": base_package},
         actor_type=ActorTypeEnum.user,

@@ -4,14 +4,15 @@ Soporta inspección previa (preview), deduplicación activa por external_ref y n
 extracción de roles y multiplicidades, consistencia con board_history y difusión WebSocket en tiempo real.
 """
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, delete
 from app.core.database import get_db
 from app.modeling.diagram.entity.board_entity import Board
 from app.modeling.diagram.entity.uml_entity import (
     Package, ClassElement, Attribute, Association,
-    ClassifierType, VisibilityEnum, AssociationType
+    ClassifierType, VisibilityEnum, AssociationType, ClassSource
 )
 from app.modeling.diagram.entity.board_normalized_entity import BoardElement, BoardHistory, BoardSnapshot, ActorTypeEnum
 from app.modeling.diagram.service.relational_mutator_service import ensure_project_and_package
@@ -32,6 +33,7 @@ router = APIRouter()
 @router.get("/boards/{board_id}/export/xmi")
 async def export_board_xmi(
     board_id: str,
+    selected_class_ids: Optional[str] = Query(None, alias="class_ids", description="IDs de clases separados por coma para exportar por selección"),
     db: AsyncSession = Depends(get_db),
     auth: BoardAuthContext = Depends(require_board_access(ProjectRole.viewer)),
 ):
@@ -58,11 +60,15 @@ async def export_board_xmi(
     if not class_ids:
         cls_all_stmt = select(ClassElement).where(ClassElement.package_id == package_id)
         cls_all_res = await db.execute(cls_all_stmt)
-        classes_db = cls_all_res.scalars().all()
+        classes_db = list(cls_all_res.scalars().all())
     else:
         cls_stmt = select(ClassElement).where(ClassElement.id.in_(class_ids))
         cls_res = await db.execute(cls_stmt)
-        classes_db = cls_res.scalars().all()
+        classes_db = list(cls_res.scalars().all())
+
+    if selected_class_ids and isinstance(selected_class_ids, str):
+        filter_set = {cid.strip() for cid in selected_class_ids.split(",") if cid.strip()}
+        classes_db = [c for c in classes_db if c.id in filter_set]
 
     classes_payload = []
     for c in classes_db:
@@ -86,6 +92,11 @@ async def export_board_xmi(
     else:
         assoc_payload = []
 
+    # Obtener paquetes del proyecto para conservar jerarquía en XMI
+    pkg_stmt = select(Package).where(Package.project_id == project_id)
+    pkg_res = await db.execute(pkg_stmt)
+    packages_payload = [{"id": p.id, "name": p.name} for p in pkg_res.scalars().all()]
+
     exporter = XmiExporter()
     xml_content = exporter.export_board(
         project_name=board.name,
@@ -93,6 +104,7 @@ async def export_board_xmi(
         classes=classes_payload,
         associations=assoc_payload,
         board_elements=board_element_map,
+        packages=packages_payload,
     )
 
     filename = f"{board.name.replace(' ', '_')}.xmi"
@@ -133,8 +145,12 @@ async def preview_board_xmi(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Error al procesar XMI: {str(e)}")
 
-    # Obtener clases existentes en el paquete
-    existing_stmt = select(ClassElement).where(ClassElement.package_id == package_id)
+    # Obtener clases existentes en todo el proyecto
+    existing_stmt = (
+        select(ClassElement)
+        .join(Package, ClassElement.package_id == Package.id)
+        .where(Package.project_id == project_id)
+    )
     existing_res = await db.execute(existing_stmt)
     existing_classes = existing_res.scalars().all()
 
@@ -244,8 +260,12 @@ async def import_board_xmi(
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Error al procesar XMI: {str(e)}")
 
-    # Clases existentes para deduplicación
-    existing_stmt = select(ClassElement).where(ClassElement.package_id == package_id)
+    # Clases existentes en el proyecto para deduplicación
+    existing_stmt = (
+        select(ClassElement)
+        .join(Package, ClassElement.package_id == Package.id)
+        .where(Package.project_id == project_id)
+    )
     existing_res = await db.execute(existing_stmt)
     existing_classes = existing_res.scalars().all()
 
@@ -255,6 +275,11 @@ async def import_board_xmi(
     created_classes = []
     updated_classes = []
     class_id_map = {}
+
+    # Paquetes del proyecto para asignación automática por jerarquía
+    pkg_stmt = select(Package).where(Package.project_id == project_id)
+    pkg_res = await db.execute(pkg_stmt)
+    project_packages_by_name = {p.name.lower(): p for p in pkg_res.scalars().all()}
 
     for cls in parsed.get("classes", []):
         c_name = cls.get("name")
@@ -282,13 +307,27 @@ async def import_board_xmi(
                 class_elem.external_ref = ext_ref
             updated_classes.append(c_name)
         else:
+            # Determinar paquete destino (conservando paquetes jerárquicos del XMI)
+            target_pkg_id = package_id
+            if cls.get("package_name"):
+                p_name = cls.get("package_name")
+                if p_name.lower() in project_packages_by_name:
+                    target_pkg_id = project_packages_by_name[p_name.lower()].id
+                else:
+                    new_pkg = Package(project_id=project_id, name=p_name)
+                    db.add(new_pkg)
+                    await db.flush()
+                    project_packages_by_name[p_name.lower()] = new_pkg
+                    target_pkg_id = new_pkg.id
+
             # Creación
             class_elem = ClassElement(
-                package_id=package_id,
+                package_id=target_pkg_id,
                 name=c_name,
                 element_type=c_type,
                 is_abstract=is_abs,
                 external_ref=ext_ref,
+                source=ClassSource.archi_import,
             )
             db.add(class_elem)
             await db.flush()

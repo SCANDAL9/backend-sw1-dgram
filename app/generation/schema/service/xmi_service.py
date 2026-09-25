@@ -77,13 +77,15 @@ class XmiExporter:
         classes: List[Dict[str, Any]],
         associations: List[Dict[str, Any]],
         board_elements: Optional[Dict[str, Dict[str, float]]] = None,
+        packages: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
-        Exporta el modelo y la vista del diagrama a XML XMI 2.1.
+        Exporta el modelo y la vista del diagrama a XML XMI 2.1 con soporte de jerarquía de paquetes.
         """
         board_elements = board_elements or {}
+        packages = packages or []
         model_id = _make_ea_id(str(uuid.uuid4()))
-        pkg_id = _make_ea_id(str(uuid.uuid4()))
+        root_pkg_id = _make_ea_id(str(uuid.uuid4()))
         diag_id = _make_ea_id(str(uuid.uuid4()))
 
         # Root <xmi:XMI>
@@ -112,18 +114,37 @@ class XmiExporter:
             },
         )
 
-        # <packagedElement xmi:type="uml:Package">
-        pkg = ET.SubElement(
+        # Contenedor raíz por defecto
+        root_pkg = ET.SubElement(
             model,
             "packagedElement",
             {
                 "xmi:type": "uml:Package",
                 "name": "Logical View",
-                "xmi:id": pkg_id,
+                "xmi:id": root_pkg_id,
             },
         )
 
+        # Crear paquetes explícitos si fueron provistos
+        pkg_elem_map: Dict[str, ET.Element] = {}
+        for p in packages:
+            p_id = p.get("id") or str(uuid.uuid4())
+            p_name = p.get("name") or "Package"
+            ea_pid = _make_ea_id(p_id)
+            pkg_elem = ET.SubElement(
+                model,
+                "packagedElement",
+                {
+                    "xmi:type": "uml:Package",
+                    "name": p_name,
+                    "xmi:id": ea_pid,
+                },
+            )
+            pkg_elem_map[p_id] = pkg_elem
+            pkg_elem_map[p_name] = pkg_elem
+
         class_id_map: Dict[str, str] = {}
+        class_node_map: Dict[str, ET.Element] = {}
 
         # 1. Clases e Interfaces
         for cls in classes:
@@ -133,11 +154,22 @@ class XmiExporter:
             class_id_map[c_id] = ea_class_id
             class_id_map[cls.get("name", "")] = ea_class_id
 
-            is_interface = cls.get("element_type") == "interface" or cls.get("stereotype") == "interface"
-            uml_type = "uml:Interface" if is_interface else "uml:Class"
+            raw_elem_type = str(cls.get("element_type") or cls.get("stereotype") or "").lower()
+            if raw_elem_type in ("enumeration", "enum"):
+                uml_type = "uml:Enumeration"
+            elif raw_elem_type == "interface":
+                uml_type = "uml:Interface"
+            elif raw_elem_type in ("datatype", "data_type"):
+                uml_type = "uml:DataType"
+            else:
+                uml_type = "uml:Class"
+
+            # Determinar paquete destino (específico o root_pkg)
+            cls_pkg_id = cls.get("package_id") or cls.get("package_name")
+            target_pkg = pkg_elem_map.get(cls_pkg_id, root_pkg)
 
             cls_elem = ET.SubElement(
-                pkg,
+                target_pkg,
                 "packagedElement",
                 {
                     "xmi:type": uml_type,
@@ -145,35 +177,81 @@ class XmiExporter:
                     "name": cls.get("name", "Class1"),
                 },
             )
+            class_node_map[ea_class_id] = cls_elem
+            class_node_map[c_id] = cls_elem
+            if cls.get("name"):
+                class_node_map[cls["name"]] = cls_elem
+
             if cls.get("is_abstract"):
                 cls_elem.set("isAbstract", "true")
 
-            # Atributos / Propiedades
+            # Atributos / Propiedades / Literales
             for attr in cls.get("attributes", []):
                 attr_id = _make_ea_id(attr.get("id") or str(uuid.uuid4()))
                 vis = VISIBILITY_MAP_TO_UML.get(str(attr.get("visibility", "public")).lower(), "public")
 
-                prop = ET.SubElement(
-                    cls_elem,
-                    "ownedAttribute",
-                    {
-                        "xmi:type": "uml:Property",
-                        "xmi:id": attr_id,
-                        "name": attr.get("name", "attr"),
-                        "visibility": vis,
-                    },
-                )
+                if uml_type == "uml:Enumeration":
+                    ET.SubElement(
+                        cls_elem,
+                        "ownedLiteral",
+                        {
+                            "xmi:type": "uml:EnumerationLiteral",
+                            "xmi:id": attr_id,
+                            "name": attr.get("name", "VAL"),
+                        },
+                    )
+                elif uml_type == "uml:Interface" or "(" in str(attr.get("name", "")):
+                    op = ET.SubElement(
+                        cls_elem,
+                        "ownedOperation",
+                        {
+                            "xmi:type": "uml:Operation",
+                            "xmi:id": attr_id,
+                            "name": attr.get("name", "operation"),
+                            "visibility": vis,
+                        },
+                    )
+                    dtype = attr.get("data_type") or attr.get("type") or "void"
+                    if dtype and dtype.lower() != "void":
+                        ret_param = ET.SubElement(
+                            op,
+                            "ownedParameter",
+                            {
+                                "xmi:type": "uml:Parameter",
+                                "xmi:id": f"{attr_id}_ret",
+                                "direction": "return",
+                            },
+                        )
+                        ET.SubElement(
+                            ret_param,
+                            "type",
+                            {
+                                "xmi:type": "uml:PrimitiveType",
+                                "href": f"http://schema.omg.org/spec/UML/2.1/uml.xml#{dtype}",
+                            },
+                        )
+                else:
+                    prop = ET.SubElement(
+                        cls_elem,
+                        "ownedAttribute",
+                        {
+                            "xmi:type": "uml:Property",
+                            "xmi:id": attr_id,
+                            "name": attr.get("name", "attr"),
+                            "visibility": vis,
+                        },
+                    )
 
-                # Tipo primitivo o personalizado
-                dtype = attr.get("data_type") or attr.get("type") or "String"
-                ET.SubElement(
-                    prop,
-                    "type",
-                    {
-                        "xmi:type": "uml:PrimitiveType",
-                        "href": f"http://schema.omg.org/spec/UML/2.1/uml.xml#{dtype}",
-                    },
-                )
+                    # Tipo primitivo o personalizado
+                    dtype = attr.get("data_type") or attr.get("type") or "String"
+                    ET.SubElement(
+                        prop,
+                        "type",
+                        {
+                            "xmi:type": "uml:PrimitiveType",
+                            "href": f"http://schema.omg.org/spec/UML/2.1/uml.xml#{dtype}",
+                        },
+                    )
 
         # 2. Asociaciones y Generalizaciones
         for assoc in associations:
@@ -189,8 +267,10 @@ class XmiExporter:
             is_real = rel_type.lower() in ["realization", "implementation"]
 
             if is_gen:
-                # Find the source class element to append <generalization>
-                src_node = pkg.find(f".//*[@xmi:id='{ea_src}']")
+                # Find the source class element to append <generalization> across any package
+                src_node = class_node_map.get(ea_src)
+                if src_node is None:
+                    src_node = class_node_map.get(src_id)
                 if src_node is not None:
                     ET.SubElement(
                         src_node,
@@ -203,7 +283,7 @@ class XmiExporter:
                     )
             elif is_real:
                 ET.SubElement(
-                    pkg,
+                    root_pkg,
                     "packagedElement",
                     {
                         "xmi:type": "uml:Realization",
@@ -215,7 +295,7 @@ class XmiExporter:
             else:
                 # Standard Association / Aggregation / Composition
                 assoc_elem = ET.SubElement(
-                    pkg,
+                    root_pkg,
                     "packagedElement",
                     {
                         "xmi:type": "uml:Association",
@@ -393,6 +473,11 @@ class XmiImporter:
         classes: List[Dict[str, Any]] = []
         associations: List[Dict[str, Any]] = []
         positions: Dict[str, Dict[str, float]] = {}
+        packages: List[Dict[str, Any]] = []
+        pkg_id_set = set()
+
+        # Build parent map for hierarchical package detection
+        parent_map = {c: p for p in root.iter() for c in p}
 
         # 1. Parse EA Geometry extensions if present
         for elem in root.iter():
@@ -409,18 +494,45 @@ class XmiImporter:
             elem_id = elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id") or elem.attrib.get("xmi:id") or elem.attrib.get("id") or ""
             name = elem.attrib.get("name")
 
-            if not elem_id or not name:
+            if not elem_id:
                 continue
 
-            if elem_type in ["uml:Class", "uml:Interface", "uml:Enumeration", "uml:DataType"] or elem.tag.endswith("Class") or elem.tag.endswith("Interface"):
+            if elem_type == "uml:Package" or elem.tag.endswith("Package"):
+                if name and name != "Logical View" and elem_id not in pkg_id_set:
+                    pkg_id_set.add(elem_id)
+                    packages.append({
+                        "id": elem_id,
+                        "name": name,
+                    })
+                continue
+
+            if elem_type in ["uml:Class", "uml:Interface", "uml:Enumeration", "uml:DataType"] or elem.tag.endswith("Class") or elem.tag.endswith("Interface") or elem.tag.endswith("Enumeration") or elem.tag.endswith("DataType"):
                 is_abstract = elem.attrib.get("isAbstract", "false").lower() == "true"
-                classifier = "interface" if "Interface" in elem_type or elem.tag.endswith("Interface") else "class"
+                if "Enumeration" in elem_type or elem.tag.endswith("Enumeration"):
+                    classifier = "enumeration"
+                elif "Interface" in elem_type or elem.tag.endswith("Interface"):
+                    classifier = "interface"
+                elif "DataType" in elem_type or elem.tag.endswith("DataType"):
+                    classifier = "datatype"
+                else:
+                    classifier = "class"
 
                 attributes = []
-                # Attributes / Properties
+                # Attributes / Properties / Literals
                 for child in elem:
                     c_type = child.attrib.get("{http://schema.omg.org/spec/XMI/2.1}type") or child.attrib.get("xmi:type") or child.tag
-                    if child.tag.endswith("ownedAttribute") or "Property" in c_type:
+                    if classifier == "enumeration" and (child.tag.endswith("ownedLiteral") or "EnumerationLiteral" in c_type or child.tag.endswith("Literal")):
+                        lit_name = child.attrib.get("name")
+                        if not lit_name:
+                            continue
+                        attributes.append({
+                            "id": child.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id") or child.attrib.get("xmi:id") or str(uuid.uuid4()),
+                            "name": lit_name,
+                            "data_type": "String",
+                            "visibility": "public",
+                            "is_pkey": False,
+                        })
+                    elif child.tag.endswith("ownedAttribute") or "Property" in c_type:
                         attr_name = child.attrib.get("name")
                         if not attr_name:
                             continue
@@ -445,9 +557,46 @@ class XmiImporter:
                             "visibility": VISIBILITY_MAP_FROM_UML.get(vis, "public"),
                             "is_pkey": is_pk,
                         })
+                    elif child.tag.endswith("ownedOperation") or "Operation" in c_type:
+                        op_name = child.attrib.get("name")
+                        if not op_name:
+                            continue
+                        vis = child.attrib.get("visibility", "public")
+                        dtype = "void"
+                        for param in child.findall(".//ownedParameter"):
+                            if param.attrib.get("direction") == "return":
+                                type_tag = param.find(".//type")
+                                if type_tag is not None:
+                                    href = type_tag.attrib.get("href", "")
+                                    if "#" in href:
+                                        dtype = href.split("#")[-1]
+                                    elif type_tag.attrib.get("name"):
+                                        dtype = type_tag.attrib.get("name")
+                        attributes.append({
+                            "id": child.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id") or child.attrib.get("xmi:id") or str(uuid.uuid4()),
+                            "name": op_name,
+                            "data_type": dtype,
+                            "visibility": VISIBILITY_MAP_FROM_UML.get(vis, "public"),
+                            "is_pkey": False,
+                        })
 
                 # Position from EA extension or default
                 pos = positions.get(elem_id, {"x": 100.0 + len(classes) * 40.0, "y": 100.0 + len(classes) * 40.0})
+
+                # Check enclosing package
+                curr = parent_map.get(elem)
+                pkg_id_for_cls = None
+                pkg_name_for_cls = None
+                while curr is not None:
+                    curr_type = curr.attrib.get("{http://schema.omg.org/spec/XMI/2.1}type") or curr.attrib.get("xmi:type") or curr.attrib.get("type") or ""
+                    if curr_type == "uml:Package" or curr.tag.endswith("Package"):
+                        curr_name = curr.attrib.get("name", "")
+                        curr_id = curr.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id") or curr.attrib.get("xmi:id") or curr.attrib.get("id") or ""
+                        if curr_name != "Logical View" and curr_id:
+                            pkg_id_for_cls = curr_id
+                            pkg_name_for_cls = curr_name
+                            break
+                    curr = parent_map.get(curr)
 
                 classes.append({
                     "id": elem_id,
@@ -457,13 +606,19 @@ class XmiImporter:
                     "is_abstract": is_abstract,
                     "attributes": attributes,
                     "position": pos,
+                    "package_id": pkg_id_for_cls,
+                    "package_name": pkg_name_for_cls,
                 })
 
             # Generalization
             if elem.tag.endswith("generalization") or elem_type == "uml:Generalization":
                 src_cls = elem.attrib.get("specific") or elem.attrib.get("client")
+                if not src_cls:
+                    parent = parent_map.get(elem)
+                    if parent is not None:
+                        src_cls = parent.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id") or parent.attrib.get("xmi:id") or parent.attrib.get("id")
                 tgt_cls = elem.attrib.get("general") or elem.attrib.get("supplier")
-                if tgt_cls:
+                if src_cls and tgt_cls:
                     associations.append({
                         "id": elem_id,
                         "sourceId": src_cls,
@@ -522,6 +677,7 @@ class XmiImporter:
                     })
 
         return {
+            "packages": packages,
             "classes": classes,
             "associations": associations,
         }

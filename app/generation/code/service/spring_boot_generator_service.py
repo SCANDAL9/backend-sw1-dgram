@@ -86,6 +86,7 @@ class SpringBootGenerator:
         # Identificar clasificadores especiales
         enums: dict[str, dict] = {}
         interfaces: dict[str, dict] = {}
+        datatypes: dict[str, dict] = {}
         entities: dict[str, dict] = {}
 
         for c in classes:
@@ -96,10 +97,13 @@ class SpringBootGenerator:
                 enums[cname] = c
             elif elem_type == "interface":
                 interfaces[cname] = c
+            elif elem_type in ("datatype", "data_type"):
+                datatypes[cname] = c
             else:
                 entities[cname] = c
 
         enum_name_set = set(enums.keys())
+        datatype_name_set = set(datatypes.keys())
 
         # Identificar relaciones de herencia / generalización
         child_to_parent: dict[str, str] = {}
@@ -131,7 +135,12 @@ class SpringBootGenerator:
         # 2. Generar Interfaces
         for iname, c in interfaces.items():
             attributes = c.get("attributes") or c.get("columns") or []
-            files[f"src/main/java/{self.base_package.replace('.', '/')}/service/{iname}.java"] = self._generate_interface(iname, attributes)
+            files[f"src/main/java/{self.base_package.replace('.', '/')}/service/{iname}.java"] = self._generate_interface(iname, attributes, enum_names=enum_name_set)
+
+        # 2.b Generar DataTypes (@Embeddable Value Objects)
+        for dtname, c in datatypes.items():
+            attributes = c.get("attributes") or c.get("columns") or []
+            files[f"src/main/java/{self.base_package.replace('.', '/')}/model/{dtname}.java"] = self._generate_embeddable(dtname, attributes, enum_names=enum_name_set)
 
         # 3. Generar Entidades, Repositorios, DTOs, Mappers, Services y Controllers
         for cname, c in entities.items():
@@ -166,6 +175,7 @@ class SpringBootGenerator:
                 tgt_assocs,
                 class_names,
                 enum_names=enum_name_set,
+                datatype_names=datatype_name_set,
                 is_abstract=is_abs,
                 parent_name=parent_name,
             )
@@ -178,11 +188,11 @@ class SpringBootGenerator:
                 files[f"src/main/java/{self.base_package.replace('.', '/')}/repository/{cname}Repository.java"] = repo_code
 
                 # DTO
-                dto_code = self._generate_dto(cname, attributes, enum_names=enum_name_set)
+                dto_code = self._generate_dto(cname, attributes, enum_names=enum_name_set, datatype_names=datatype_name_set)
                 files[f"src/main/java/{self.base_package.replace('.', '/')}/dto/{cname}DTO.java"] = dto_code
 
                 # Mapper
-                mapper_code = self._generate_mapper(cname, attributes, enum_names=enum_name_set)
+                mapper_code = self._generate_mapper(cname, attributes, enum_names=enum_name_set, datatype_names=datatype_name_set)
                 files[f"src/main/java/{self.base_package.replace('.', '/')}/mapper/{cname}Mapper.java"] = mapper_code
 
                 # Service
@@ -225,15 +235,88 @@ class SpringBootGenerator:
         ]
         return "\n".join(lines)
 
-    def _generate_interface(self, interface_name: str, attributes: list[dict]) -> str:
-        lines = [
+    def _generate_interface(self, interface_name: str, attributes: list[dict], enum_names: set[str] | None = None) -> str:
+        enum_names = enum_names or set()
+        has_dates = any(attr.get("type", "").upper() in ("DATE", "DATETIME", "TIMESTAMP") for attr in attributes)
+        has_uuid = any(attr.get("type", "").upper() in ("UUID",) for attr in attributes)
+
+        imports = [
             f"package {self.base_package}.service;",
             "",
+        ]
+        if has_dates or has_uuid:
+            imports.append("import java.util.*;")
+            imports.append("import java.time.*;")
+        if any(attr.get("type") in enum_names for attr in attributes):
+            imports.append(f"import {self.base_package}.enums.*;")
+        if imports[-1] != "":
+            imports.append("")
+
+        lines = imports + [
             f"public interface {interface_name} {{",
         ]
         for attr in attributes:
             name = to_camel_case(attr.get("name") or "method")
-            lines.append(f"    void {name}();")
+            raw_type = attr.get("type") or attr.get("data_type") or "void"
+            if raw_type.lower() == "void":
+                ret_type = "void"
+            elif raw_type in enum_names:
+                ret_type = raw_type
+            else:
+                ret_type = map_sql_to_java_type(raw_type)
+            lines.append(f"    {ret_type} {name}();")
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _generate_embeddable(self, class_name: str, attributes: list[dict], enum_names: set[str] | None = None) -> str:
+        enum_names = enum_names or set()
+        has_enums = any((attr.get("type") in enum_names) for attr in attributes)
+
+        imports = [
+            f"package {self.base_package}.model;",
+            "",
+            "import jakarta.persistence.*;",
+            "import java.util.*;",
+            "import lombok.Getter;",
+            "import lombok.Setter;",
+            "import lombok.NoArgsConstructor;",
+            "import lombok.AllArgsConstructor;",
+            "import lombok.Builder;",
+        ]
+        if has_enums:
+            imports.append(f"import {self.base_package}.enums.*;")
+
+        imports.append("")
+        imports.append("@Embeddable")
+        imports.append("@Getter")
+        imports.append("@Setter")
+        imports.append("@NoArgsConstructor")
+        imports.append("@AllArgsConstructor")
+        imports.append("@Builder")
+        imports.append(f"public class {class_name} {{")
+        imports.append("")
+
+        lines = imports
+        for attr in attributes:
+            name = to_camel_case(attr.get("name") or "field")
+            raw_type = attr.get("type", "VARCHAR")
+            is_enum_field = raw_type in enum_names
+            jtype = raw_type if is_enum_field else map_sql_to_java_type(raw_type)
+            vis_symbol = attr.get("visibility", "-")
+            vis_map = {"+": "public", "-": "private", "#": "protected", "~": ""}
+            java_vis = vis_map.get(vis_symbol, "private")
+            vis_prefix = f"{java_vis} " if java_vis else ""
+
+            if is_enum_field:
+                lines.append("    @Enumerated(EnumType.STRING)")
+                lines.append(f'    @Column(name = "{attr.get("name", name)}")')
+                lines.append(f"    {vis_prefix}{jtype} {name};")
+                lines.append("")
+            else:
+                lines.append(f'    @Column(name = "{attr.get("name", name)}")')
+                lines.append(f"    {vis_prefix}{jtype} {name};")
+                lines.append("")
+
         lines.append("}")
         return "\n".join(lines)
 
@@ -245,11 +328,14 @@ class SpringBootGenerator:
         tgt_assocs: list[dict],
         class_names: dict[str, str],
         enum_names: set[str] | None = None,
+        datatype_names: set[str] | None = None,
         is_abstract: bool = False,
         parent_name: str | None = None,
     ) -> str:
         enum_names = enum_names or set()
+        datatype_names = datatype_names or set()
         has_enums = any((attr.get("type") in enum_names) for attr in attributes)
+        has_datatypes = any((attr.get("type") in datatype_names) for attr in attributes)
 
         pk_attrs = [
             attr for attr in attributes
@@ -270,6 +356,8 @@ class SpringBootGenerator:
         ]
         if has_enums:
             imports.append(f"import {self.base_package}.enums.*;")
+        if has_datatypes:
+            imports.append(f"import {self.base_package}.model.*;")
 
         imports.append("")
         extends_clause = f" extends {parent_name}" if parent_name else ""
@@ -300,7 +388,8 @@ class SpringBootGenerator:
             name = to_camel_case(attr.get("name") or "attr")
             raw_type = attr.get("type", "VARCHAR")
             is_enum_field = raw_type in enum_names
-            jtype = raw_type if is_enum_field else map_sql_to_java_type(raw_type)
+            is_datatype_field = raw_type in datatype_names
+            jtype = raw_type if (is_enum_field or is_datatype_field) else map_sql_to_java_type(raw_type)
             is_pk = bool(attr.get("pk", False) or attr.get("is_pkey", False) or attr.get("is_primary_key", False))
             is_derived = bool(attr.get("is_derived", False) or attr.get("isDerived", False))
             vis_symbol = attr.get("visibility", "-")
@@ -326,6 +415,10 @@ class SpringBootGenerator:
             elif is_enum_field:
                 lines.append("    @Enumerated(EnumType.STRING)")
                 lines.append(f'    @Column(name = "{attr.get("name", name)}")')
+                lines.append(f"    {vis_prefix}{jtype} {name};")
+                lines.append("")
+            elif is_datatype_field:
+                lines.append("    @Embedded")
                 lines.append(f"    {vis_prefix}{jtype} {name};")
                 lines.append("")
             else:
@@ -495,9 +588,17 @@ public interface {class_name}Repository extends JpaRepository<{class_name}, {id_
 }}
 """
 
-    def _generate_dto(self, class_name: str, attributes: list[dict], enum_names: set[str] | None = None) -> str:
+    def _generate_dto(
+        self,
+        class_name: str,
+        attributes: list[dict],
+        enum_names: set[str] | None = None,
+        datatype_names: set[str] | None = None,
+    ) -> str:
         enum_names = enum_names or set()
+        datatype_names = datatype_names or set()
         has_enums = any((attr.get("type") in enum_names) for attr in attributes)
+        has_datatypes = any((attr.get("type") in datatype_names) for attr in attributes)
         lines = [
             f"package {self.base_package}.dto;",
             "",
@@ -510,7 +611,9 @@ public interface {class_name}Repository extends JpaRepository<{class_name}, {id_
         ]
         if has_enums:
             lines.append(f"import {self.base_package}.enums.*;")
-            lines.append("")
+        if has_datatypes:
+            lines.append(f"import {self.base_package}.model.*;")
+        lines.append("")
 
         lines.append("@Getter")
         lines.append("@Setter")
@@ -523,7 +626,8 @@ public interface {class_name}Repository extends JpaRepository<{class_name}, {id_
             name = to_camel_case(attr.get("name") or "attr")
             raw_type = attr.get("type", "VARCHAR")
             is_enum_field = raw_type in enum_names
-            jtype = raw_type if is_enum_field else map_sql_to_java_type(raw_type)
+            is_datatype_field = raw_type in datatype_names
+            jtype = raw_type if (is_enum_field or is_datatype_field) else map_sql_to_java_type(raw_type)
             is_pk = bool(attr.get("pk", False) or attr.get("is_pkey", False) or attr.get("is_primary_key", False))
             is_nullable = attr.get("nullable", True)
 
@@ -545,9 +649,17 @@ public interface {class_name}Repository extends JpaRepository<{class_name}, {id_
         lines.append("}")
         return "\n".join(lines)
 
-    def _generate_mapper(self, class_name: str, attributes: list[dict], enum_names: set[str] | None = None) -> str:
+    def _generate_mapper(
+        self,
+        class_name: str,
+        attributes: list[dict],
+        enum_names: set[str] | None = None,
+        datatype_names: set[str] | None = None,
+    ) -> str:
         enum_names = enum_names or set()
+        datatype_names = datatype_names or set()
         has_enums = any((attr.get("type") in enum_names) for attr in attributes)
+        has_datatypes = any((attr.get("type") in datatype_names) for attr in attributes)
         lines = [
             f"package {self.base_package}.mapper;",
             "",
@@ -557,6 +669,8 @@ public interface {class_name}Repository extends JpaRepository<{class_name}, {id_
         ]
         if has_enums:
             lines.append(f"import {self.base_package}.enums.*;")
+        if has_datatypes:
+            lines.append(f"import {self.base_package}.model.*;")
 
         lines.append("")
         lines.append("@Component")
