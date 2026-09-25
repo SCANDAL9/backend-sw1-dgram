@@ -8,6 +8,10 @@ class ColumnData(BaseModel):
     fk: bool = False
     nullable: bool = True
     references: str | None = None
+    visibility: str = "public"
+    is_derived: bool = False
+    default_value: str | None = None
+    order_index: int = 0
 
 
 class Position(BaseModel):
@@ -18,6 +22,7 @@ class Position(BaseModel):
 class CommandPayload(BaseModel):
     entity_id: str | None = None
     entity_name: str | None = None
+    source: str | None = None
     columns: list[ColumnData] | None = None
     column_name: str | None = None
     column_changes: dict | None = None
@@ -53,6 +58,7 @@ class CommandPayload(BaseModel):
     target_multiplicity: str | None = None
     # Classifier metadata
     is_abstract: bool | None = None
+    is_visible: bool | None = None
     element_type: str | None = None
 
     model_config = {"extra": "allow"}

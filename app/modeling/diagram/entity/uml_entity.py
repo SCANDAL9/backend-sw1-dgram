@@ -19,6 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
+from app.workspace.authentication.entity.user_entity import User  # noqa: F401
 
 
 # ─── Enums ───────────────────────────────────────────────────────────────────
@@ -95,6 +96,8 @@ class ClassElement(Base):
     )
     # True = no tabla física; solo sus hijas concretas se mapean a @Entity
     is_abstract: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Control de visibilidad en el lienzo (True = visible, False = oculto)
+    is_visible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     external_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source: Mapped[ClassSource] = mapped_column(
         SAEnum(ClassSource, name="class_source"), default=ClassSource.manual, nullable=False

@@ -138,9 +138,37 @@ class CommandHandler:
                     raise ValueError(f"Cannot create relation: endpoints '{src}' and '{tgt}' must both exist as entities")
 
                 rel_type = str(payload.get("relation_type", "")).lower()
+                src_entity = self.entities.get(src, {})
+                tgt_entity = self.entities.get(tgt, {})
+                src_t = str(src_entity.get("element_type", "class")).lower()
+                tgt_t = str(tgt_entity.get("element_type", "class")).lower()
+
                 if any(gt in rel_type for gt in ("generalization", "realization", "inheritance")):
                     if check_generalization_cycle(self.relations, src, tgt):
                         raise ValueError(f"Cyclic inheritance detected: '{src}' cannot inherit from '{tgt}'")
+                    if "generalization" in rel_type or "inheritance" in rel_type:
+                        if "enum" in src_t or "enum" in tgt_t:
+                            raise ValueError("Los clasificadores de tipo Enumeration no pueden participar en herencias.")
+                        if "datatype" in src_t or "datatype" in tgt_t:
+                            raise ValueError("Los clasificadores de tipo DataType no pueden participar en herencias.")
+                        if src_t in ("class", "abstract_class", "abstract") and tgt_t == "interface":
+                            raise ValueError("Una clase no puede heredar de una interfaz; debe usar Realization.")
+                        if src_t == "interface" and tgt_t in ("class", "abstract_class", "abstract"):
+                            raise ValueError("Una interfaz no puede heredar de una clase.")
+                        if src_t in ("class", "abstract_class", "abstract"):
+                            for r in self.relations.values():
+                                if r.get("source_id") == src and "generalization" in str(r.get("type", "")).lower():
+                                    raise ValueError("Multiple inheritance is not allowed for classes")
+                    elif "realization" in rel_type:
+                        if tgt_t != "interface":
+                            raise ValueError("La Realización solo puede tener como destino una Interfaz.")
+                        if src_t == "interface":
+                            raise ValueError("Una interfaz no realiza otra interfaz; debe heredar mediante Generalización.")
+                        if "enum" in src_t or "datatype" in src_t:
+                            raise ValueError("Los enums y datatypes no pueden realizar interfaces.")
+                elif any(at in rel_type for at in ("association", "aggregation", "composition")):
+                    if "enum" in src_t or "enum" in tgt_t:
+                        raise ValueError("Los enums no pueden conectarse mediante asociaciones directas.")
 
             elif cmd_type == "UPDATE_RELATION":
                 rel_id = payload.get("relation_id") or payload.get("entity_id")

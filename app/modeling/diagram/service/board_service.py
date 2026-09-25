@@ -154,6 +154,27 @@ async def save_snapshot_normalized(
     )
     effective_actor_type = ActorTypeEnum.ai if is_ai else ActorTypeEnum.user
 
+    # 0. Asegurar que el board existe en la tabla boards antes de insertar en board_history
+    safe_actor_id = (
+        actor_id
+        if actor_id and actor_id != "guest" and not str(actor_id).startswith("guest")
+        else None
+    )
+    b_stmt = select(Board).where(Board.id == board_id)
+    b_res = await db.execute(b_stmt)
+    b_obj = b_res.scalar_one_or_none()
+    if not b_obj:
+        b_obj = Board(
+            id=board_id,
+            name=f"Board {board_id}",
+            owner_id=safe_actor_id or "system",
+            diagram_version=model_version,
+        )
+        db.add(b_obj)
+        await db.flush()
+    else:
+        b_obj.diagram_version = max(model_version, (b_obj.diagram_version or 0) + 1)
+
     history_id = None
     if command_id:
         existing_h = await db.execute(
@@ -169,7 +190,7 @@ async def save_snapshot_normalized(
                 command_id=command_id,
                 command_type=command_type,
                 payload=payload,
-                actor_id=actor_id,
+                actor_id=safe_actor_id,
                 actor_type=effective_actor_type,
                 model_version=model_version,
             )
@@ -192,18 +213,6 @@ async def save_snapshot_normalized(
         if ai_act:
             ai_act.board_history_id = history_id
             ai_act.status = ActionStatus.success
-
-    # 2. Optimistic locking en boards
-    result = await db.execute(
-        text(
-            "UPDATE boards SET diagram_version = :new_v, updated_at = NOW() "
-            "WHERE id = :board_id AND diagram_version = :expected_v"
-        ),
-        {"new_v": model_version, "board_id": board_id, "expected_v": expected_version},
-    )
-    if result.rowcount == 0:
-        await db.rollback()
-        return False
 
     # 3. board_snapshots — caché regenerable (idempotente)
     snap_stmt = select(BoardSnapshot).where(

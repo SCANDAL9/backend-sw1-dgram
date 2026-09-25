@@ -9,11 +9,37 @@ from app.modeling.diagram.entity.board_entity import Board
 from app.workspace.projects.entity.project_entity import Project
 from app.modeling.diagram.entity.uml_entity import (
     Package, ClassElement, Attribute, Association, AssociationType, VisibilityEnum, ClassifierType,
-    AssociationClassLink
+    AssociationClassLink, ClassSource
 )
 from app.modeling.diagram.entity.board_normalized_entity import BoardElement
 from app.modeling.diagram.dto.command_dto import Command
 from app.workspace.history.service.state_reconstructor_service import coerce_uuid, parse_assoc_type
+
+
+def parse_visibility(raw_vis: str | None) -> VisibilityEnum:
+    if not raw_vis:
+        return VisibilityEnum.public
+    val = str(raw_vis).lower().strip()
+    mapping = {
+        "public": VisibilityEnum.public,
+        "private": VisibilityEnum.private,
+        "protected": VisibilityEnum.protected,
+        "package": VisibilityEnum.package,
+    }
+    return mapping.get(val, VisibilityEnum.public)
+
+
+def parse_class_source(raw_src: str | None) -> ClassSource:
+    if not raw_src:
+        return ClassSource.manual
+    val = str(raw_src).lower().strip()
+    mapping = {
+        "manual": ClassSource.manual,
+        "archi_import": ClassSource.archi_import,
+        "image_ocr": ClassSource.image_ocr,
+        "ocr": ClassSource.image_ocr,
+    }
+    return mapping.get(val, ClassSource.manual)
 
 
 def parse_classifier_type(raw_type: str | None) -> ClassifierType:
@@ -90,9 +116,17 @@ async def apply_command_to_relational_db(
         elem_type_raw = payload.get("element_type") or payload.get("elementType") or payload.get("stereotype")
         classifier_type = parse_classifier_type(elem_type_raw)
         is_abs = bool(payload.get("is_abstract", False) or payload.get("isAbstract", False) or classifier_type == ClassifierType.abstract_class)
+        raw_is_vis = payload.get("is_visible")
+        if raw_is_vis is None:
+            raw_is_vis = payload.get("isVisible")
+        is_vis = True if raw_is_vis is None else bool(raw_is_vis)
         chosen_pkg_id = payload.get("package_id") or package_id
 
-        # Verificar si ya existe
+        pos = payload.get("position") or {"x": 100.0, "y": 100.0}
+        w = payload.get("width")
+        h = payload.get("height")
+
+        # Verificar si ya existe ClassElement
         existing_class = await db.get(ClassElement, class_id)
         if not existing_class:
             new_class = ClassElement(
@@ -101,15 +135,38 @@ async def apply_command_to_relational_db(
                 name=class_name,
                 element_type=classifier_type,
                 is_abstract=is_abs,
+                is_visible=is_vis,
+                source=parse_class_source(payload.get("source")),
                 created_by=actor_id,
             )
             db.add(new_class)
             await db.flush()
 
-            # Añadir BoardElement para layout
-            pos = payload.get("position") or {"x": 100.0, "y": 100.0}
-            w = payload.get("width")
-            h = payload.get("height")
+            # Añadir atributos iniciales
+            cols = payload.get("columns") or payload.get("attributes") or []
+            for idx, col in enumerate(cols):
+                attr = Attribute(
+                    id=str(uuid.uuid4()),
+                    class_id=class_id,
+                    name=col.get("name", f"col_{idx}"),
+                    data_type=col.get("type", "VARCHAR"),
+                    visibility=parse_visibility(col.get("visibility")),
+                    is_pkey=bool(col.get("pk", False)),
+                    is_fkey=bool(col.get("fk", False)),
+                    is_derived=bool(col.get("is_derived", False)),
+                    default_value=col.get("default_value"),
+                    order_index=idx,
+                )
+                db.add(attr)
+
+        # Garantizar que el BoardElement exista y esté actualizado en este tablero
+        be_stmt = select(BoardElement).where(
+            BoardElement.board_id == board_id,
+            BoardElement.class_id == class_id,
+        )
+        be_res = await db.execute(be_stmt)
+        existing_be = be_res.scalar_one_or_none()
+        if not existing_be:
             board_elem = BoardElement(
                 id=str(uuid.uuid4()),
                 board_id=board_id,
@@ -120,28 +177,21 @@ async def apply_command_to_relational_db(
                 height=float(h) if h is not None else None,
             )
             db.add(board_elem)
-
-            # Añadir atributos iniciales
-            cols = payload.get("columns") or payload.get("attributes") or []
-            for idx, col in enumerate(cols):
-                attr = Attribute(
-                    id=str(uuid.uuid4()),
-                    class_id=class_id,
-                    name=col.get("name", f"col_{idx}"),
-                    data_type=col.get("type", "VARCHAR"),
-                    is_pkey=bool(col.get("pk", False)),
-                    is_fkey=bool(col.get("fk", False)),
-                    is_derived=bool(col.get("is_derived", False)),
-                    default_value=col.get("default_value"),
-                    order_index=idx,
-                )
-                db.add(attr)
+        else:
+            existing_be.x = float(pos.get("x", existing_be.x))
+            existing_be.y = float(pos.get("y", existing_be.y))
+            if w is not None:
+                existing_be.width = float(w)
+            if h is not None:
+                existing_be.height = float(h)
 
     # 2. Eliminación de Entidad/Clase
     elif cmd_type in ("DELETE_ENTITY", "DELETE_CLASS"):
         raw_id = payload.get("entity_id") or payload.get("class_id")
         if raw_id:
             class_id = coerce_uuid(raw_id)
+            # Desvincular de association_class_link si actuaba como clase intermedia
+            await db.execute(delete(AssociationClassLink).where(AssociationClassLink.class_id == class_id))
             # Eliminar board_element y class_element
             await db.execute(delete(BoardElement).where(BoardElement.board_id == board_id, BoardElement.class_id == class_id))
             await db.execute(delete(ClassElement).where(ClassElement.id == class_id))
@@ -153,14 +203,29 @@ async def apply_command_to_relational_db(
             class_id = coerce_uuid(raw_id)
             cls_obj = await db.get(ClassElement, class_id)
             if cls_obj:
+                old_name = cls_obj.name
                 new_name = payload.get("entity_name") or payload.get("class_name") or payload.get("name")
+                is_type = cls_obj.element_type in (ClassifierType.enumeration, ClassifierType.datatype)
                 if new_name:
                     cls_obj.name = new_name
+                    if is_type and old_name and new_name != old_name:
+                        await db.execute(
+                            update(Attribute)
+                            .where(Attribute.data_type == old_name)
+                            .values(data_type=new_name)
+                        )
                 elem_type_raw = payload.get("element_type") or payload.get("elementType") or payload.get("stereotype")
                 if elem_type_raw is not None:
                     cls_obj.element_type = parse_classifier_type(elem_type_raw)
                 if "is_abstract" in payload or "isAbstract" in payload:
                     cls_obj.is_abstract = bool(payload.get("is_abstract", False) or payload.get("isAbstract", False))
+                raw_is_vis = payload.get("is_visible")
+                if raw_is_vis is None:
+                    raw_is_vis = payload.get("isVisible")
+                if raw_is_vis is not None:
+                    cls_obj.is_visible = bool(raw_is_vis)
+                if "source" in payload and payload["source"]:
+                    cls_obj.source = parse_class_source(payload["source"])
                 if payload.get("package_id"):
                     cls_obj.package_id = payload["package_id"]
 
@@ -239,6 +304,7 @@ async def apply_command_to_relational_db(
                 class_id=class_id,
                 name=attr_name,
                 data_type=col.get("type", "VARCHAR"),
+                visibility=parse_visibility(col.get("visibility")),
                 is_pkey=bool(col.get("pk", False)),
                 is_fkey=bool(col.get("fk", False)),
                 is_derived=bool(col.get("is_derived", False)),
@@ -262,6 +328,8 @@ async def apply_command_to_relational_db(
                     attr.name = changes["name"]
                 if "type" in changes:
                     attr.data_type = changes["type"]
+                if "visibility" in changes:
+                    attr.visibility = parse_visibility(changes["visibility"])
                 if "pk" in changes:
                     attr.is_pkey = bool(changes["pk"])
                 if "fk" in changes:
@@ -289,11 +357,51 @@ async def apply_command_to_relational_db(
 
         existing_assoc = await db.get(Association, assoc_id)
         if not existing_assoc:
+            parsed_rel_type = parse_assoc_type(rel_type_str)
+
+            # Validación semántica entre clasificadores
+            if src_id == tgt_id and parsed_rel_type in (AssociationType.generalization, AssociationType.realization):
+                raise ValueError("Un clasificador no puede tener relaciones de herencia o realización hacia sí mismo.")
+
+            src_cls = await db.get(ClassElement, src_id)
+            tgt_cls = await db.get(ClassElement, tgt_id)
+            if src_cls and tgt_cls:
+                src_t = (src_cls.element_type.value if hasattr(src_cls.element_type, "value") else str(src_cls.element_type)).lower()
+                tgt_t = (tgt_cls.element_type.value if hasattr(tgt_cls.element_type, "value") else str(tgt_cls.element_type)).lower()
+
+                if parsed_rel_type == AssociationType.generalization:
+                    if "enum" in src_t or "enum" in tgt_t:
+                        raise ValueError("Los clasificadores de tipo Enumeration no pueden participar en herencias.")
+                    if "datatype" in src_t or "datatype" in tgt_t:
+                        raise ValueError("Los clasificadores de tipo DataType no pueden participar en herencias.")
+                    if src_t in ("class", "abstract_class") and tgt_t == "interface":
+                        raise ValueError("Una clase no puede heredar de una interfaz; debe usar Realization.")
+                    if src_t == "interface" and tgt_t in ("class", "abstract_class"):
+                        raise ValueError("Una interfaz no puede heredar de una clase.")
+                    if src_t in ("class", "abstract_class"):
+                        existing_parent_stmt = select(Association).where(
+                            Association.source_class_id == src_id,
+                            Association.type == AssociationType.generalization,
+                        )
+                        existing_parent_res = await db.execute(existing_parent_stmt)
+                        if existing_parent_res.scalar_one_or_none():
+                            raise ValueError("Herencia múltiple entre clases no soportada por el modelo relacional ni Spring Boot.")
+                elif parsed_rel_type == AssociationType.realization:
+                    if tgt_t != "interface":
+                        raise ValueError("La Realización solo puede tener como destino una Interfaz.")
+                    if src_t == "interface":
+                        raise ValueError("Una interfaz no realiza otra interfaz; debe heredar mediante Generalización.")
+                    if "enum" in src_t or "datatype" in src_t:
+                        raise ValueError("Los enums y datatypes no pueden realizar interfaces.")
+                elif parsed_rel_type in (AssociationType.association, AssociationType.aggregation, AssociationType.composition):
+                    if "enum" in src_t or "enum" in tgt_t:
+                        raise ValueError("Los enums no pueden conectarse mediante asociaciones directas.")
+
             assoc = Association(
                 id=assoc_id,
                 source_class_id=src_id,
                 target_class_id=tgt_id,
-                type=parse_assoc_type(rel_type_str),
+                type=parsed_rel_type,
                 name=payload.get("name"),
                 source_role=payload.get("source_role"),
                 target_role=payload.get("target_role"),
