@@ -21,20 +21,29 @@ async def check_board_access(db: AsyncSession, board_id: str, user_id: str) -> t
     if not board:
         return True, "owner"
 
-    if board.owner_id in DEMO_OWNERS or board.owner_id == user_id or not board.owner_id:
+    board_owner_str = str(board.owner_id).strip() if board.owner_id else ""
+    user_id_str = str(user_id).strip() if user_id else ""
+
+    if (
+        board_owner_str in DEMO_OWNERS
+        or not board_owner_str
+        or board_owner_str == user_id_str
+    ):
         return True, "owner"
 
     if not board.project_id:
         return True, "editor"
 
     proj = await db.get(Project, board.project_id)
-    if proj and (proj.owner_id in DEMO_OWNERS or proj.owner_id == user_id):
-        return True, "owner"
+    if proj:
+        proj_owner_str = str(proj.owner_id).strip() if proj.owner_id else ""
+        if proj_owner_str in DEMO_OWNERS or proj_owner_str == user_id_str:
+            return True, "owner"
 
     pm_res = await db.execute(
         select(ProjectMember).where(
             ProjectMember.project_id == board.project_id,
-            ProjectMember.user_id == user_id,
+            ProjectMember.user_id == user_id_str,
         )
     )
     pm = pm_res.scalar_one_or_none()

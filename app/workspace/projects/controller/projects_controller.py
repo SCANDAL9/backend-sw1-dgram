@@ -345,6 +345,7 @@ async def list_board_project_classes(
 
 
 @router.post("/boards/{board_id}/attach-class/{class_id}")
+@router.post("/boards/{board_id}/classes/{class_id}/attach")
 async def attach_class_to_board(
     board_id: str,
     class_id: str,
@@ -400,6 +401,64 @@ async def attach_class_to_board(
         "x": req.x,
         "y": req.y,
     }
+
+
+@router.delete("/boards/{board_id}/classes/{class_id}/detach")
+async def detach_class_from_board(
+    board_id: str,
+    class_id: str,
+    db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.editor)),
+):
+    from app.modeling.diagram.entity.board_normalized_entity import BoardElement
+    await db.execute(
+        delete(BoardElement).where(
+            BoardElement.board_id == board_id,
+            BoardElement.class_id == class_id,
+        )
+    )
+    await db.commit()
+    return {"status": "detached", "class_id": class_id, "board_id": board_id}
+
+
+@router.delete("/boards/{board_id}/classes/{class_id}/model")
+async def delete_class_from_board_model(
+    board_id: str,
+    class_id: str,
+    db: AsyncSession = Depends(get_db),
+    auth: BoardAuthContext = Depends(require_board_access(ProjectRole.editor)),
+):
+    from app.modeling.diagram.entity.uml_entity import ClassElement
+    from app.modeling.diagram.entity.board_normalized_entity import BoardElement
+
+    cls = await db.get(ClassElement, class_id)
+    if not cls:
+        return {"status": "not_found", "class_id": class_id}
+
+    await db.execute(delete(BoardElement).where(BoardElement.class_id == class_id))
+    await db.execute(delete(ClassElement).where(ClassElement.id == class_id))
+    await db.commit()
+    return {"status": "deleted_from_model", "class_id": class_id}
+
+
+@router.delete("/projects/{project_id}/classes/{class_id}")
+async def delete_class_from_project_model(
+    project_id: str,
+    class_id: str,
+    db: AsyncSession = Depends(get_db),
+    auth: ProjectAuthContext = Depends(require_project_role(ProjectRole.editor)),
+):
+    from app.modeling.diagram.entity.uml_entity import ClassElement
+    from app.modeling.diagram.entity.board_normalized_entity import BoardElement
+
+    cls = await db.get(ClassElement, class_id)
+    if not cls:
+        return {"status": "not_found", "class_id": class_id}
+
+    await db.execute(delete(BoardElement).where(BoardElement.class_id == class_id))
+    await db.execute(delete(ClassElement).where(ClassElement.id == class_id))
+    await db.commit()
+    return {"status": "deleted_from_project", "class_id": class_id}
 
 
 # CRUD de Proyectos
