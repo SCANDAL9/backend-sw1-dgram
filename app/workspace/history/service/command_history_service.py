@@ -92,6 +92,12 @@ class CommandHistory:
         )
         effective_actor_type = ActorTypeEnum.ai if is_ai else ActorTypeEnum.user
 
+        safe_actor_id = (
+            actor_id
+            if actor_id and actor_id != "guest" and not str(actor_id).startswith("guest")
+            else None
+        )
+
         try:
             async with async_session_factory() as session:
                 entry = BoardHistory(
@@ -100,7 +106,7 @@ class CommandHistory:
                     command_id=command.command_id,
                     command_type=cmd_type_str,
                     payload=payload_dict,
-                    actor_id=actor_id,
+                    actor_id=safe_actor_id,
                     actor_type=effective_actor_type,
                     model_version=command.model_version,
                 )

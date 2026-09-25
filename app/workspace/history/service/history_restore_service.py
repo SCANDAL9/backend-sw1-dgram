@@ -143,6 +143,11 @@ async def _execute_restore_on_session(
 
     # 3. Registrar comando RESTORE_VERSION en board_history
     restore_cmd_id = f"cmd-restore-{uuid.uuid4()}"
+    safe_actor_id = (
+        actor_id
+        if actor_id and actor_id != "guest" and not str(actor_id).startswith("guest")
+        else None
+    )
     history_entry = BoardHistory(
         id=str(uuid.uuid4()),
         board_id=board_id,
@@ -154,7 +159,7 @@ async def _execute_restore_on_session(
             "entities_restored": len(entities),
             "relations_restored": len(relations),
         },
-        actor_id=actor_id,
+        actor_id=safe_actor_id,
         actor_type=ActorTypeEnum.user,
         model_version=new_version,
     )

@@ -152,6 +152,7 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             "package_id": ce.package_id,
             "element_type": ce.element_type.value if hasattr(ce.element_type, "value") else str(ce.element_type),
             "is_abstract": bool(ce.is_abstract),
+            "is_visible": bool(getattr(ce, "is_visible", True) if getattr(ce, "is_visible", True) is not None else True),
         })
 
         classes.append({
@@ -159,6 +160,7 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             "name": ce.name,
             "package_id": ce.package_id,
             "is_abstract": bool(ce.is_abstract),
+            "is_visible": bool(getattr(ce, "is_visible", True) if getattr(ce, "is_visible", True) is not None else True),
             "element_type": ce.element_type.value if hasattr(ce.element_type, "value") else str(ce.element_type),
             "attributes": attributes_list,
         })
@@ -183,6 +185,7 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             links = {l.association_id: l.class_id for l in link_res.scalars().all()}
 
         for asc in assoc_rows:
+            assoc_class_link_id = links.get(asc.id)
             card_map = {
                 "one_to_one": "1:1",
                 "one_to_many": "1:n",
@@ -193,13 +196,13 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             }
             card_val = getattr(asc, "cardinality", getattr(asc, "target_multiplicity", "1:n"))
             rel_type = card_map.get(str(card_val).lower(), "1:n")
-            assoc_class_link_id = links.get(asc.id)
-
+            asc_type = asc.type.value if hasattr(asc.type, "value") else str(asc.type)
             relations.append({
                 "id": asc.id,
                 "source_id": asc.source_class_id,
                 "target_id": asc.target_class_id,
-                "type": rel_type,
+                "type": asc_type,
+                "cardinality": rel_type,
                 "name": asc.name,
                 "source_role": asc.source_role,
                 "target_role": asc.target_role,
