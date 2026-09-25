@@ -18,6 +18,14 @@ async def get_or_create_guide_session(
     user_id: str | None = None,
 ) -> GuideSession:
     """Busca o crea una sesión persistente de guía y onboarding para este board."""
+    clean_uid = (
+        user_id
+        if user_id
+        and not str(user_id).startswith("guest")
+        and not str(user_id).startswith("user-")
+        and str(user_id) not in {"system", "demo", "public", "user-test"}
+        else None
+    )
     stmt = (
         select(GuideSession)
         .where(
@@ -32,7 +40,7 @@ async def get_or_create_guide_session(
         session = GuideSession(
             board_id=board_id,
             session_token=session_token,
-            user_id=user_id,
+            user_id=clean_uid,
             completed_steps=[],
         )
         db.add(session)

@@ -115,6 +115,7 @@ class AgentOrchestrator:
         user_prompt: str,
         user_id: str | None = None,
         force_agent: AgentType | None = None,
+        conversation_id: str | None = None,
     ) -> OrchestratorResponse:
         """
         Enruta la solicitud al agente adecuado, ejecuta el ciclo de tools y persiste la auditoría.
@@ -122,7 +123,17 @@ class AgentOrchestrator:
         agent_type = force_agent or self.classify_intent(user_prompt)
 
         # 1. Obtener o crear conversación de chat
-        conv = await get_or_create_conversation(db, board_id, user_id)
+        persisted_user_id = (
+            user_id
+            if user_id
+            and not str(user_id).startswith("guest")
+            and not str(user_id).startswith("user-")
+            and str(user_id) not in {"system", "demo", "public", "user-test"}
+            else None
+        )
+        conv = await get_or_create_conversation(
+            db, board_id, persisted_user_id, conversation_id=conversation_id
+        )
         conv_id = str(conv.id)
 
         # Guardar mensaje del usuario
@@ -130,7 +141,7 @@ class AgentOrchestrator:
             id=str(uuid.uuid4()),
             conversation_id=conv_id,
             sender_type=ActorTypeEnum.user,
-            user_id=user_id,
+            user_id=persisted_user_id,
             content_text=user_prompt,
         )
         db.add(user_msg)

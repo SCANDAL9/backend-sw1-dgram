@@ -6,11 +6,14 @@ Soporta Function Calling en tiempo real y Vision OCR multimodal.
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.modeling.ai.entity.chat_entity import ChatConversation, ChatMessage, AiAction, ActionStatus, ActorTypeEnum
-from app.modeling.diagram.dto.command_dto import Command
-from app.modeling.diagram.dto.command_dto import CommandType
-from app.modeling.diagram.dto.command_dto import CommandPayload
+from app.modeling.ai.entity.chat_entity import (
+    ChatConversation, ChatMessage, ChatAttachment, AttachmentType,
+    AiAction, ActionStatus, ActorTypeEnum,
+)
+from app.modeling.diagram.dto.command_dto import Command, CommandType, CommandPayload
+from app.modeling.diagram.dto.command_payload_dto import ColumnData
 from app.modeling.ai.agent.vertex_client import vertex_ai_client
+from app.modeling.ai.service.attachment_storage_service import save_attachment_file
 
 
 def parse_intent_and_generate_commands(user_prompt: str, current_state: dict) -> tuple[str, list[dict]]:
@@ -29,27 +32,61 @@ def parse_intent_and_generate_commands(user_prompt: str, current_state: dict) ->
     return reply_text, result_cmds
 
 
-async def get_or_create_conversation(db: AsyncSession, board_id: str, user_id: str | None = None) -> ChatConversation:
-    stmt = (
-        select(ChatConversation)
-        .where(ChatConversation.board_id == board_id)
-        .order_by(ChatConversation.created_at.desc())
-    )
-    res = await db.execute(stmt)
-    conv = res.scalar_one_or_none()
-    if not conv:
-        conv = ChatConversation(
-            id=str(uuid.uuid4()),
-            board_id=board_id,
-            started_by=user_id,
+def _clean_user_id(uid: str | None) -> str | None:
+    if not uid:
+        return None
+    raw = str(uid)
+    if raw.startswith("guest") or raw.startswith("user-") or raw in {"system", "demo", "public", "user-test"}:
+        return None
+    return raw
+
+
+async def get_or_create_conversation(
+    db: AsyncSession,
+    board_id: str,
+    user_id: str | None = None,
+    conversation_id: str | None = None,
+    force_new: bool = False,
+) -> ChatConversation:
+    clean_uid = _clean_user_id(user_id)
+    if not force_new and conversation_id:
+        stmt = (
+            select(ChatConversation)
+            .where(
+                ChatConversation.board_id == board_id,
+                ChatConversation.id == conversation_id,
+            )
         )
-        db.add(conv)
-        await db.commit()
-        await db.refresh(conv)
+        res = await db.execute(stmt)
+        conv = res.scalar_one_or_none()
+        if conv:
+            return conv
+
+    if not force_new:
+        stmt = (
+            select(ChatConversation)
+            .where(ChatConversation.board_id == board_id)
+            .order_by(ChatConversation.created_at.desc())
+        )
+        res = await db.execute(stmt)
+        conv = res.scalar_one_or_none()
+        if conv:
+            return conv
+
+    conv = ChatConversation(
+        id=str(uuid.uuid4()),
+        board_id=board_id,
+        started_by=clean_uid,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
     return conv
 
 
-def _tool_calls_to_commands(tool_calls: list[dict], current_state: dict) -> list[tuple[str, dict, Command | None, ActionStatus]]:
+def _tool_calls_to_commands(
+    tool_calls: list[dict], current_state: dict, source: str = "manual"
+) -> list[tuple[str, dict, Command | None, ActionStatus]]:
     """Convierte las llamadas de herramientas de Vertex AI a objetos Command del dominio."""
     results = []
     entities_count = len(current_state.get("entities", []))
@@ -68,11 +105,13 @@ def _tool_calls_to_commands(tool_calls: list[dict], current_state: dict) -> list
             # Normalizar atributos
             normalized_attrs = []
             for a in attrs:
+                vis_val = a.get("visibility") or a.get("vis") or "public"
                 normalized_attrs.append({
                     "name": a.get("name", "attr"),
                     "type": a.get("type", "VARCHAR(255)"),
                     "pk": a.get("pk", False),
                     "fk": a.get("fk", False),
+                    "visibility": vis_val,
                 })
 
             cmd_id = str(uuid.uuid4())
@@ -84,13 +123,14 @@ def _tool_calls_to_commands(tool_calls: list[dict], current_state: dict) -> list
                 payload=CommandPayload(
                     entity_id=eid,
                     entity_name=class_name,
+                    source=source,
                     columns=normalized_attrs,
                     position={
                         "x": args.get("x", 200 + ((entities_count + idx) * 80)),
                         "y": args.get("y", 150 + ((idx % 3) * 60)),
                     },
                 ),
-                actor="ai:vertex-gemini",
+                actor="ai:copilot",
             )
             results.append(("create_class", args, cmd, ActionStatus.success))
 
@@ -99,6 +139,7 @@ def _tool_calls_to_commands(tool_calls: list[dict], current_state: dict) -> list
             attr_name = args.get("attribute_name", "campo")
             attr_type = args.get("attribute_type", "VARCHAR(255)")
             pk = args.get("pk", False)
+            vis_val = args.get("visibility") or args.get("vis") or "public"
 
             # Buscar entity_id: primero en las creadas en este turno, luego en current_state
             target_id = None
@@ -128,9 +169,10 @@ def _tool_calls_to_commands(tool_calls: list[dict], current_state: dict) -> list
                         "type": attr_type,
                         "pk": pk,
                         "fk": False,
+                        "visibility": vis_val,
                     },
                 ),
-                actor="ai:vertex-gemini",
+                actor="ai:copilot",
             )
             results.append(("add_attribute", args, cmd, ActionStatus.success))
 
@@ -378,14 +420,15 @@ async def process_chat_message(
     """
     Procesa un mensaje de chat mediante Vertex AI, persiste en BD y ejecuta acciones.
     """
-    conv = await get_or_create_conversation(db, board_id, user_id)
+    clean_uid = _clean_user_id(user_id)
+    conv = await get_or_create_conversation(db, board_id, clean_uid)
 
     # 1. Guardar mensaje del usuario
     user_msg = ChatMessage(
         id=str(uuid.uuid4()),
         conversation_id=conv.id,
         sender_type=ActorTypeEnum.user,
-        user_id=user_id,
+        user_id=clean_uid,
         content_text=content,
     )
     db.add(user_msg)
@@ -444,21 +487,39 @@ async def process_vision_image(
     mime_type: str,
     current_state: dict,
     prompt: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """
-    Procesa una imagen de boceto o pizarra mediante Vertex AI Vision y genera entidades UML.
+    Procesa una imagen de boceto o pizarra mediante análisis visual y genera entidades UML.
     """
-    conv = await get_or_create_conversation(db, board_id, user_id)
+    clean_uid = _clean_user_id(user_id)
+    conv = await get_or_create_conversation(
+        db, board_id, clean_uid, conversation_id=conversation_id
+    )
 
     # 1. Mensaje de usuario indicando imagen subida
     user_msg = ChatMessage(
         id=str(uuid.uuid4()),
         conversation_id=conv.id,
         sender_type=ActorTypeEnum.user,
-        user_id=user_id,
+        user_id=clean_uid,
         content_text=prompt or "[Imagen de diagrama adjuntada para análisis OCR]",
     )
     db.add(user_msg)
+    await db.flush()
+
+    # 1.b Guardar adjunto en ChatAttachment y disco
+    attachment_id = str(uuid.uuid4())
+    storage_url = save_attachment_file(board_id, attachment_id, image_bytes, mime_type)
+    attachment = ChatAttachment(
+        id=attachment_id,
+        chat_message_id=user_msg.id,
+        type=AttachmentType.image,
+        storage_url=storage_url,
+        mime_type=mime_type,
+        order_index=0,
+    )
+    db.add(attachment)
     await db.flush()
 
     # 2. Análisis multimodal con Vertex AI
@@ -469,7 +530,7 @@ async def process_vision_image(
         current_state=current_state,
     )
 
-    mapped_actions = _tool_calls_to_commands(tool_calls, current_state)
+    mapped_actions = _tool_calls_to_commands(tool_calls, current_state, source="image_ocr")
 
     # 3. Guardar mensaje de IA
     ai_msg = ChatMessage(
@@ -504,4 +565,9 @@ async def process_vision_image(
         "reply": reply_text,
         "commands": generated_commands,
         "conversation_id": conv.id,
+        "attachment": {
+            "id": attachment.id,
+            "storage_url": attachment.storage_url,
+            "mime_type": attachment.mime_type,
+        },
     }

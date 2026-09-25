@@ -4,9 +4,10 @@ audio_service.py — Servicio de procesamiento y transcripción de audio para IA
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
-from app.modeling.ai.entity.chat_entity import ChatMessage, AiAction, ActorTypeEnum
+from app.modeling.ai.entity.chat_entity import ChatMessage, ChatAttachment, AttachmentType, AiAction, ActorTypeEnum
 from app.modeling.ai.service.ai_service import get_or_create_conversation, _tool_calls_to_commands
 from app.modeling.ai.agent.vertex_client import vertex_ai_client
+from app.modeling.ai.service.attachment_storage_service import save_attachment_file
 from app.workspace.history.service.state_reconstructor_service import get_normalized_board_state
 
 ALLOWED_AUDIO_TYPES = {
@@ -62,9 +63,23 @@ async def process_audio_file(
         conversation_id=conv.id,
         sender_type=ActorTypeEnum.user,
         user_id=user_id,
-        content_text=f"[Nota de voz transcrita]: \"{transcript}\"",
+        content_text=f'[Nota de voz transcrita]: "{transcript}"',
     )
     db.add(user_msg)
+    await db.flush()
+
+    # 2.b Guardar adjunto de audio en ChatAttachment y disco
+    attachment_id = str(uuid.uuid4())
+    storage_url = save_attachment_file(board_id, attachment_id, audio_bytes, normalized_mime)
+    attachment = ChatAttachment(
+        id=attachment_id,
+        chat_message_id=user_msg.id,
+        type=AttachmentType.audio,
+        storage_url=storage_url,
+        mime_type=normalized_mime,
+        order_index=0,
+    )
+    db.add(attachment)
     await db.flush()
 
     # 3. Mapear tool calls a comandos del dominio
@@ -104,4 +119,9 @@ async def process_audio_file(
         "reply": reply_text,
         "commands": generated_commands,
         "conversation_id": conv.id,
+        "attachment": {
+            "id": attachment.id,
+            "storage_url": attachment.storage_url,
+            "mime_type": attachment.mime_type,
+        },
     }

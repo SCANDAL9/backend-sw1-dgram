@@ -19,6 +19,18 @@ from app.modeling.ai.service.guide_service import (
 router = APIRouter()
 
 
+from app.core.dependencies import require_board_access, BoardAuthContext, DEMO_OWNERS
+
+
+def _sanitize_user_id(auth: BoardAuthContext) -> str | None:
+    if not auth.user or not auth.user.id:
+        return None
+    raw = str(auth.user.id)
+    if raw.startswith("guest") or raw.startswith("user-") or raw in DEMO_OWNERS:
+        return None
+    return raw
+
+
 @router.post("/boards/{board_id}/explain")
 async def explain_target_endpoint(
     board_id: str,
@@ -30,7 +42,7 @@ async def explain_target_endpoint(
     Explica el elemento sobre el que se soltó la burbuja guía.
     Combina catálogo estático con razonamiento de Vertex AI cuando es dinámico.
     """
-    caller_user_id = str(auth.user.id)
+    caller_user_id = _sanitize_user_id(auth)
     result = await explain_target(
         db,
         board_id=board_id,
@@ -52,7 +64,7 @@ async def ask_guide_endpoint(
     """
     Responde a preguntas formuladas al agente de guía.
     """
-    caller_user_id = str(auth.user.id)
+    caller_user_id = _sanitize_user_id(auth)
     result = await ask_guide(
         db,
         board_id=board_id,
@@ -74,7 +86,7 @@ async def complete_step_endpoint(
     """
     Registra el progreso del tour de onboarding guiado.
     """
-    caller_user_id = str(auth.user.id)
+    caller_user_id = _sanitize_user_id(auth)
     completed = await record_completed_step(
         db,
         board_id=board_id,

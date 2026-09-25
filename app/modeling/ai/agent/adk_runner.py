@@ -430,7 +430,13 @@ class ADKAgentRunner:
                     resp = await client.post(url, headers=headers, json=body)
                     if resp.status_code != 200:
                         logger.error("Error en llamada a Vertex AI (%d): %s", resp.status_code, resp.text)
-                        break
+                        return await self._run_offline_fallback(
+                            db=db,
+                            board_id=board_id,
+                            user_prompt=user_prompt,
+                            user_id=user_id,
+                            session_state=session_state,
+                        )
 
                     data = resp.json()
                     candidates = data.get("candidates", [])
@@ -489,7 +495,13 @@ class ADKAgentRunner:
 
                 except Exception as e:
                     logger.error("Error en turno %d de ADKAgentRunner: %s", turn, e)
-                    break
+                    return await self._run_offline_fallback(
+                        db=db,
+                        board_id=board_id,
+                        user_prompt=user_prompt,
+                        user_id=user_id,
+                        session_state=session_state,
+                    )
 
         return AgentRunResult(
             agent_name=self.agent_name,
@@ -515,6 +527,61 @@ class ADKAgentRunner:
         commands_executed: list[CommandExecutionResult] = []
 
         prompt_lower = user_prompt.lower()
+
+        # 0. Guide Agent fallback
+        if self.agent_name == "GuideAgent":
+            guide_reply = (
+                "¡Hola! Soy tu **GuideAgent** (mentor de dgram).\n\n"
+                "• **Crear clases**: Haz clic en el botón '+' en la barra superior o indícamelo aquí (ej. *'Crea una clase Pedido con total y fecha'*).\n"
+                "• **Relaciones**: Arrastra desde el conector de una clase hacia la clase destino en el lienzo.\n"
+                "• **Visibilidad**: Oculta o muestra entidades desde el panel explorador con el icono del ojo.\n"
+                "• **Atajos**: `Ctrl+Z` (deshacer), `Ctrl+Y` (rehacer), `Delete` (eliminar seleccionado).\n"
+                "• **Exportar**: Usa el botón de exportación en la cabecera para obtener código Spring Boot 3 o diagrama en imagen."
+            )
+            return AgentRunResult(
+                agent_name=self.agent_name,
+                reply_text=guide_reply,
+                traces=traces,
+                commands_executed=commands_executed,
+            )
+
+        # 0.1 CodeGen Agent fallback
+        if self.agent_name == "CodeGenAgent":
+            out, tr, _ = await self.execute_tool(
+                tool_name="get_diagram_summary",
+                tool_args={},
+                db=db,
+                board_id=board_id,
+                user_id=user_id,
+            )
+            traces.append(tr)
+            summary = DiagramSummary(**out)
+            sample_class = summary.class_names[0] if summary.class_names else "Entity"
+            codegen_reply = (
+                f"Aquí tienes el modelo de entidad Spring Boot 3.3.x (Java 21) para `{sample_class}`:\n\n"
+                f"```java\n"
+                f"package com.dgram.generated.entity;\n\n"
+                f"import jakarta.persistence.*;\n"
+                f"import lombok.*;\n\n"
+                f"@Entity\n"
+                f"@Table(name = \"{sample_class.lower()}\")\n"
+                f"@Getter @Setter\n"
+                f"@NoArgsConstructor @AllArgsConstructor\n"
+                f"@Builder\n"
+                f"public class {sample_class} {{\n"
+                f"    @Id\n"
+                f"    @GeneratedValue(strategy = GenerationType.IDENTITY)\n"
+                f"    private Long id;\n"
+                f"}}\n"
+                f"```\n\n"
+                f"*(Puedes pedirme generar Repositories, DTOs Records y RestControllers para cualquier entidad del diagrama)*"
+            )
+            return AgentRunResult(
+                agent_name=self.agent_name,
+                reply_text=codegen_reply,
+                traces=traces,
+                commands_executed=commands_executed,
+            )
 
         # 1. Consulta / Resumen
         if any(w in prompt_lower for w in ["resumen", "summary", "cuantas clases", "métricas", "metricas"]):
@@ -585,7 +652,7 @@ class ADKAgentRunner:
                 commands_executed=commands_executed,
             )
 
-        # 4. Creación de clase
+        # 4. Creación de clase (y relación si se solicita)
         create_match = re.search(r"(?:crea|agrega|añade|nueva)\s+(?:una\s+|un\s+)?(?:tabla|clase|entidad)\s+([a-zA-Z0-9_]+)", prompt_lower)
         if create_match:
             cname = create_match.group(1).capitalize()
@@ -607,7 +674,6 @@ class ADKAgentRunner:
 
             attrs = [{"name": "id", "type": id_type, "pk": True, "fk": False}]
             if "email" in prompt_lower:
-
                 attrs.append({"name": "email", "type": "VARCHAR(255)", "pk": False, "fk": False})
             if "nombre" in prompt_lower:
                 attrs.append({"name": "nombre", "type": "VARCHAR(255)", "pk": False, "fk": False})
@@ -630,6 +696,30 @@ class ADKAgentRunner:
             if cmd_res:
                 commands_executed.append(cmd_res)
 
+            # Verificar si se solicita relación con otra clase
+            rel_target_match = re.search(r"(?:con\s+relaci[oó]n\s+a|relacionad[ao]\s+con)\s+([a-zA-Z0-9_]+)", prompt_lower)
+            rel_reply_extra = ""
+            if rel_target_match:
+                target_cls = rel_target_match.group(1).capitalize()
+                rel_out, rel_tr, rel_cmd_res = await self.execute_tool(
+                    tool_name="execute_diagram_command",
+                    tool_args={
+                        "command_type": "CREATE_ASSOCIATION",
+                        "payload": {
+                            "source_entity_id": cname,
+                            "target_entity_id": target_cls,
+                            "association_type": "1:N",
+                        },
+                    },
+                    db=db,
+                    board_id=board_id,
+                    user_id=user_id,
+                )
+                traces.append(rel_tr)
+                if rel_cmd_res and rel_cmd_res.status == "success":
+                    commands_executed.append(rel_cmd_res)
+                    rel_reply_extra = f" y su relación con {target_cls}"
+
             # Emitir acción UI para resaltar la nueva entidad
             _, ui_tr, _ = await self.execute_tool(
                 tool_name="emit_ui_action",
@@ -647,10 +737,49 @@ class ADKAgentRunner:
 
             return AgentRunResult(
                 agent_name=self.agent_name,
-                reply_text=f"He creado la clase {cname} con éxito.",
+                reply_text=f"He creado la clase {cname}{rel_reply_extra} con éxito.",
                 traces=traces,
                 commands_executed=commands_executed,
             )
+
+        # 4.b Edición / Actualización de clase
+        edit_match = re.search(
+            r"(?:edita|modifica|cambia|renombra)\s+(?:la\s+)?(?:tabla|clase|entidad)?\s*([a-zA-Z0-9_]+)\s+(?:a|por|para que se llame)\s+([a-zA-Z0-9_]+)",
+            prompt_lower,
+        )
+        if edit_match:
+            old_name = edit_match.group(1).capitalize()
+            new_name = edit_match.group(2).capitalize()
+            out, tr, cmd_res = await self.execute_tool(
+                tool_name="execute_diagram_command",
+                tool_args={
+                    "command_type": "UPDATE_CLASS",
+                    "payload": {
+                        "class_name": old_name,
+                        "entity_name": new_name,
+                        "name": new_name,
+                    },
+                },
+                db=db,
+                board_id=board_id,
+                user_id=user_id,
+            )
+            traces.append(tr)
+            if cmd_res and cmd_res.status == "success":
+                commands_executed.append(cmd_res)
+                return AgentRunResult(
+                    agent_name=self.agent_name,
+                    reply_text=f"He actualizado la clase {old_name} para que se llame {new_name}.",
+                    traces=traces,
+                    commands_executed=commands_executed,
+                )
+            else:
+                return AgentRunResult(
+                    agent_name=self.agent_name,
+                    reply_text=f"No pude actualizar la clase {old_name}: {out.get('error') or out.get('detail') or 'clase no encontrada'}.",
+                    traces=traces,
+                    commands_executed=commands_executed,
+                )
 
         # 5. Creación de paquete
         pkg_match = re.search(r"(?:crea|agrega|añade|nuevo)\s+(?:un\s+)?paquete\s+([a-zA-Z0-9_]+)", prompt_lower)

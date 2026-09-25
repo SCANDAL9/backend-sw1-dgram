@@ -7,6 +7,7 @@ Categorías:
 2. Herramientas de Interacción con la UI (Client Actions via WebSocket)
 3. Herramientas de Mutación (Command Protocol con CommandHandler)
 """
+import uuid
 from typing import Any
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,7 @@ from app.workspace.history.service.state_reconstructor_service import get_normal
 class AttributeDetail(BaseModel):
     name: str
     type: str
+    visibility: str = "public"
     pk: bool = False
     fk: bool = False
     nullable: bool = False
@@ -48,6 +50,8 @@ class ClassDetail(BaseModel):
     element_type: str = "class"
     stereotype: str | None = None
     is_abstract: bool = False
+    is_visible: bool = True
+    source: str = "manual"
     attributes: list[AttributeDetail] = Field(default_factory=list)
     associations: list[AssociationDetail] = Field(default_factory=list)
 
@@ -88,6 +92,7 @@ class CommandExecutionResult(BaseModel):
     command_type: str
     applied_to_board: str
     detail: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,6 +139,7 @@ async def tool_get_class_details(
         AttributeDetail(
             name=a.name,
             type=a.data_type,
+            visibility=a.visibility.value if hasattr(a.visibility, "value") else str(a.visibility or "public"),
             pk=bool(a.is_pkey),
             fk=bool(a.is_fkey),
             nullable=True,
@@ -175,6 +181,8 @@ async def tool_get_class_details(
         element_type=class_elem.element_type.value if hasattr(class_elem.element_type, "value") else str(class_elem.element_type),
         stereotype=getattr(class_elem, "stereotype", None),
         is_abstract=bool(class_elem.is_abstract),
+        is_visible=bool(getattr(class_elem, "is_visible", True)),
+        source=class_elem.source.value if hasattr(class_elem.source, "value") else str(class_elem.source or "manual"),
         attributes=attrs,
         associations=assocs_list,
     )
@@ -223,9 +231,84 @@ async def tool_execute_diagram_command(
     from app.modeling.diagram.service import board_service
 
     cmd_type_enum = CommandType(command_type) if isinstance(command_type, str) else command_type
-    effective_payload = payload if payload is not None else (payload_dict or {})
-    cmd_payload = CommandPayload(**effective_payload)
+    effective_payload = dict(payload if payload is not None else (payload_dict or {}))
 
+    # 1. Cargar snapshot actual si existe para resolver entidades
+    state = await get_normalized_board_state(db, board_id) or {}
+    entities = state.get("entities", [])
+
+    # Resoluci\u00f3n para CREATE_CLASS / CREATE_ENTITY
+    if cmd_type_enum in (CommandType.CREATE_CLASS, CommandType.CREATE_ENTITY):
+        eid = effective_payload.get("entity_id") or effective_payload.get("class_id") or str(uuid.uuid4())
+        effective_payload["entity_id"] = eid
+        effective_payload["class_id"] = eid
+        cname = effective_payload.get("entity_name") or effective_payload.get("class_name") or effective_payload.get("name") or "Entity"
+        effective_payload["entity_name"] = cname
+        effective_payload["class_name"] = cname
+        if not effective_payload.get("position"):
+            effective_payload["position"] = {
+                "x": 200 + (len(entities) * 70),
+                "y": 150 + ((len(entities) % 4) * 50),
+            }
+
+    # Resoluci\u00f3n para UPDATE / DELETE de entidad o atributos
+    elif cmd_type_enum in (
+        CommandType.UPDATE_CLASS,
+        CommandType.UPDATE_ENTITY,
+        CommandType.DELETE_CLASS,
+        CommandType.DELETE_ENTITY,
+        CommandType.ADD_ATTRIBUTE,
+        CommandType.UPDATE_ATTRIBUTE,
+        CommandType.DELETE_ATTRIBUTE,
+    ):
+        target_raw = (
+            effective_payload.get("entity_id")
+            or effective_payload.get("class_id")
+            or effective_payload.get("class_name")
+            or effective_payload.get("entity_name")
+            or effective_payload.get("name")
+        )
+        if target_raw:
+            target_str = str(target_raw).strip()
+            target_lower = target_str.lower()
+            for e in entities:
+                if str(e.get("id")) == target_str or str(e.get("name", "")).strip().lower() == target_lower:
+                    effective_payload["entity_id"] = str(e.get("id"))
+                    effective_payload["class_id"] = str(e.get("id"))
+                    break
+
+    # Resoluci\u00f3n para CREATE_RELATION / CREATE_ASSOCIATION
+    elif cmd_type_enum in (CommandType.CREATE_RELATION, CommandType.CREATE_ASSOCIATION):
+        for src_k in ("source_entity_id", "source_class_id", "source_id", "source_class", "source"):
+            if effective_payload.get(src_k):
+                val = str(effective_payload[src_k]).strip()
+                val_lower = val.lower()
+                for e in entities:
+                    if str(e.get("id")) == val or str(e.get("name", "")).strip().lower() == val_lower:
+                        effective_payload["source_entity_id"] = str(e.get("id"))
+                        effective_payload["source_class_id"] = str(e.get("id"))
+                        break
+                if effective_payload.get("source_entity_id"):
+                    break
+
+        for tgt_k in ("target_entity_id", "target_class_id", "target_id", "target_class", "target"):
+            if effective_payload.get(tgt_k):
+                val = str(effective_payload[tgt_k]).strip()
+                val_lower = val.lower()
+                for e in entities:
+                    if str(e.get("id")) == val or str(e.get("name", "")).strip().lower() == val_lower:
+                        effective_payload["target_entity_id"] = str(e.get("id"))
+                        effective_payload["target_class_id"] = str(e.get("id"))
+                        break
+                if effective_payload.get("target_entity_id"):
+                    break
+
+        if not effective_payload.get("relation_id") and not effective_payload.get("association_id"):
+            rel_id = str(uuid.uuid4())
+            effective_payload["relation_id"] = rel_id
+            effective_payload["association_id"] = rel_id
+
+    cmd_payload = CommandPayload(**effective_payload)
     effective_actor = actor or (f"user:{user_id}" if user_id else "ai:adk-agent")
 
     cmd = Command(
@@ -236,9 +319,6 @@ async def tool_execute_diagram_command(
 
     history = CommandHistory(board_id)
     handler = CommandHandler(board_id, history)
-
-    # 1. Cargar snapshot actual si existe
-    state = await get_normalized_board_state(db, board_id)
     if state:
         handler.load_snapshot(state)
 
@@ -295,6 +375,7 @@ async def tool_execute_diagram_command(
         command_type=cmd_type_enum.value,
         applied_to_board=board_id,
         detail=f"Version: {handler.version}",
+        payload=payload_dict_clean,
     )
 
 
