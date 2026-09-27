@@ -23,6 +23,9 @@ class SchemaMapper:
                     "data_type": a.data_type,
                     "visibility": a.visibility.value if hasattr(a.visibility, "value") else str(a.visibility),
                     "is_pkey": a.is_pkey,
+                    "is_fkey": getattr(a, "is_fkey", False),
+                    "is_derived": getattr(a, "is_derived", False),
+                    "default_value": getattr(a, "default_value", None),
                 }
                 for a in attrs
             ],

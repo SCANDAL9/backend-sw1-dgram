@@ -11,7 +11,7 @@ from sqlalchemy import select, func, delete
 from app.core.database import get_db
 from app.modeling.diagram.entity.board_entity import Board
 from app.modeling.diagram.entity.uml_entity import (
-    Package, ClassElement, Attribute, Association,
+    Package, ClassElement, Attribute, Association, AssociationClassLink,
     ClassifierType, VisibilityEnum, AssociationType, ClassSource
 )
 from app.modeling.diagram.entity.board_normalized_entity import BoardElement, BoardHistory, BoardSnapshot, ActorTypeEnum
@@ -76,7 +76,13 @@ async def export_board_xmi(
         attr_res = await db.execute(attr_stmt)
         attrs = attr_res.scalars().all()
 
-        pos = board_element_map.get(c.id, {"x": 100.0, "y": 100.0})
+        pos = dict(board_element_map.get(c.id, {"x": 100.0, "y": 100.0, "w": 200.0, "h": 70.0}))
+        # Calcular altura ergonómica proporcional si height es nulo o el valor rígido por defecto (160.0)
+        num_attrs = len(attrs)
+        dynamic_h = max(56.0, 56.0 + (num_attrs * 18.0))
+        if pos.get("h") in (None, 160.0):
+            pos["h"] = dynamic_h
+        board_element_map[c.id] = pos
         classes_payload.append(SchemaMapper.class_to_dict(c, attrs, pos))
 
     # Obtener asociaciones
@@ -88,14 +94,48 @@ async def export_board_xmi(
         )
         assoc_res = await db.execute(assoc_stmt)
         associations_db = assoc_res.scalars().all()
-        assoc_payload = [SchemaMapper.association_to_dict(a) for a in associations_db]
+        assoc_ids = [a.id for a in associations_db]
+
+        assoc_class_map = {}
+        if assoc_ids:
+            acl_stmt = select(AssociationClassLink).where(AssociationClassLink.association_id.in_(assoc_ids))
+            acl_res = await db.execute(acl_stmt)
+            for acl in acl_res.scalars().all():
+                assoc_class_map[acl.association_id] = acl.class_id
+
+        assoc_payload = []
+        for a in associations_db:
+            ad = SchemaMapper.association_to_dict(a)
+            if a.id in assoc_class_map:
+                ad["association_class_id"] = assoc_class_map[a.id]
+            # Normalizar multiplicidades si están en NULL en la base de datos
+            if not ad.get("source_multiplicity") and not ad.get("target_multiplicity"):
+                if ad.get("association_class_id"):
+                    ad["source_multiplicity"] = "0..*"
+                    ad["target_multiplicity"] = "0..*"
+                else:
+                    rel_t = str(ad.get("type", "")).lower()
+                    if rel_t in ("association", "aggregation", "composition"):
+                        ad["source_multiplicity"] = "1"
+                        ad["target_multiplicity"] = "0..*"
+            elif ad.get("association_class_id"):
+                if not ad.get("source_multiplicity"):
+                    ad["source_multiplicity"] = "0..*"
+                if not ad.get("target_multiplicity"):
+                    ad["target_multiplicity"] = "0..*"
+            assoc_payload.append(ad)
     else:
         assoc_payload = []
 
-    # Obtener paquetes del proyecto para conservar jerarquía en XMI
+    # Obtener paquetes del proyecto para conservar jerarquía en XMI (excluyendo el placeholder 'default' si es único)
     pkg_stmt = select(Package).where(Package.project_id == project_id)
     pkg_res = await db.execute(pkg_stmt)
-    packages_payload = [{"id": p.id, "name": p.name} for p in pkg_res.scalars().all()]
+    raw_pkgs = pkg_res.scalars().all()
+    # Si solo existe el paquete técnico 'default', no lo enviamos como subpaquete para que las clases residan directamente en el paquete del Board
+    if len(raw_pkgs) == 1 and raw_pkgs[0].name.lower() in ("default", "logical view"):
+        packages_payload = []
+    else:
+        packages_payload = [{"id": p.id, "name": p.name} for p in raw_pkgs if p.name.lower() not in ("default", "logical view")]
 
     exporter = XmiExporter()
     xml_content = exporter.export_board(
