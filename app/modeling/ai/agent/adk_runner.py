@@ -505,10 +505,53 @@ class ADKAgentRunner:
 
         return AgentRunResult(
             agent_name=self.agent_name,
-            reply_text="Operación procesada.",
+            reply_text=self._synthesize_execution_reply(commands_executed),
             traces=traces,
             commands_executed=commands_executed,
         )
+
+    def _synthesize_execution_reply(self, commands_executed: list[CommandExecutionResult]) -> str:
+        """Sintetiza un mensaje de confirmación claro y detallado de las acciones ejecutadas."""
+        if not commands_executed:
+            return "Operación procesada correctamente sin modificaciones al diagrama."
+
+        success_items = []
+        failed_items = []
+
+        for cmd in commands_executed:
+            name = (
+                cmd.payload.get("name")
+                or cmd.payload.get("class_name")
+                or cmd.payload.get("entity_name")
+                or ""
+            )
+            if cmd.status == "success":
+                if cmd.command_type == "CREATE_CLASS":
+                    success_items.append(f"tabla/clase **{name or 'nueva'}** creada")
+                elif cmd.command_type == "UPDATE_CLASS":
+                    success_items.append(f"tabla/clase **{name}** actualizada")
+                elif cmd.command_type == "DELETE_CLASS":
+                    success_items.append(f"tabla/clase **{name}** eliminada")
+                elif cmd.command_type == "CREATE_ASSOCIATION":
+                    src = cmd.payload.get("source_entity_id") or ""
+                    tgt = cmd.payload.get("target_entity_id") or ""
+                    rel = cmd.payload.get("association_type") or "relación"
+                    success_items.append(f"relación {rel} entre **{src}** y **{tgt}** establecida")
+                elif cmd.command_type == "DELETE_ASSOCIATION":
+                    success_items.append("relación eliminada")
+                else:
+                    success_items.append(f"acción `{cmd.command_type}` aplicada")
+            else:
+                err = cmd.detail or "error al ejecutar la acción"
+                failed_items.append(f"{cmd.command_type}: {err}")
+
+        parts = []
+        if success_items:
+            parts.append(f"✅ Se ha realizado correctamente: {', '.join(success_items)}.")
+        if failed_items:
+            parts.append(f"⚠️ Hubo un problema al procesar: {', '.join(failed_items)}.")
+
+        return " ".join(parts) if parts else "Operación procesada exitosamente."
 
     async def _run_offline_fallback(
         self,

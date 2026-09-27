@@ -32,6 +32,7 @@ async def process_audio_file(
     audio_bytes: bytes,
     mime_type: str,
     prompt: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict:
     """
     Procesa un archivo de audio pregrabado, lo transcribe y genera comandos para el diagrama.
@@ -46,7 +47,7 @@ async def process_audio_file(
             detail=f"Formato de audio no soportado: '{mime_type}'. Permitidos: wav, mp3, ogg, webm, m4a.",
         )
 
-    conv = await get_or_create_conversation(db, board_id, user_id)
+    conv = await get_or_create_conversation(db, board_id, user_id, conversation_id=conversation_id)
     current_state = await get_normalized_board_state(db, board_id) or {}
 
     # 1. Transcripción y análisis con Vertex AI o fallback

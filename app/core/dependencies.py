@@ -3,7 +3,7 @@ dependencies.py — Dependencias centralizadas de autenticación y autorización
 """
 from dataclasses import dataclass
 from typing import Callable
-from fastapi import Depends, HTTPException, Header, Path
+from fastapi import Depends, HTTPException, Header, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -38,13 +38,17 @@ class BoardAuthContext:
 
 async def get_current_user(
     authorization: str | None = Header(None),
+    token: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Extrae y valida el JWT del header Authorization: Bearer <token>."""
-    if not authorization or not authorization.startswith("Bearer "):
+    """Extrae y valida el JWT del header Authorization: Bearer <token> o del parámetro query token."""
+    auth_header = authorization
+    if not auth_header and token:
+        auth_header = f"Bearer {token}"
+    if not auth_header or not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token de autorización requerido")
-    token = authorization.split(" ")[1]
-    payload = auth_service.decode_jwt_token(token)
+    raw_token = auth_header.split(" ")[1]
+    payload = auth_service.decode_jwt_token(raw_token)
     if not payload or "sub" not in payload:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
@@ -56,9 +60,10 @@ async def get_current_user(
 
 async def get_current_user_optional(
     authorization: str | None = Header(None),
+    token: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> User | None:
-    """Extrae el usuario si se suministra un token válido; de lo contrario retorna None."""
+    """Extrae el usuario si se suministra un token válido (header o query param); de lo contrario retorna None."""
     from app.main import app
     if get_current_user in app.dependency_overrides:
         override = app.dependency_overrides[get_current_user]
@@ -70,13 +75,18 @@ async def get_current_user_optional(
                 kwargs["db"] = db
             if "authorization" in sig.parameters:
                 kwargs["authorization"] = authorization
+            if "token" in sig.parameters:
+                kwargs["token"] = token
             if inspect.iscoroutinefunction(override):
                 return await override(**kwargs)
             return override(**kwargs)
-    if not authorization or not authorization.startswith("Bearer "):
+    auth_header = authorization
+    if not auth_header and token:
+        auth_header = f"Bearer {token}"
+    if not auth_header or not auth_header.startswith("Bearer "):
         return None
-    token = authorization.split(" ")[1]
-    payload = auth_service.decode_jwt_token(token)
+    raw_token = auth_header.split(" ")[1]
+    payload = auth_service.decode_jwt_token(raw_token)
     if not payload or "sub" not in payload:
         return None
     return await db.get(User, payload["sub"])

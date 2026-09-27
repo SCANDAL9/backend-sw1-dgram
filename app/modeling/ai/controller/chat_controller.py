@@ -261,6 +261,7 @@ async def upload_diagram_audio_transcription(
     board_id: str,
     file: UploadFile = File(...),
     prompt: str | None = Form(None),
+    conversation_id: str | None = Form(None),
     auth: BoardAuthContext = Depends(require_board_access(min_role=ProjectRole.editor)),
     db: AsyncSession = Depends(get_db),
 ):
@@ -282,6 +283,7 @@ async def upload_diagram_audio_transcription(
         audio_bytes=content_bytes,
         mime_type=mime_type,
         prompt=prompt,
+        conversation_id=conversation_id,
     )
     return result
 
