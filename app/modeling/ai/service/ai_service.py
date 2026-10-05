@@ -488,9 +488,12 @@ async def process_vision_image(
     current_state: dict,
     prompt: str | None = None,
     conversation_id: str | None = None,
+    audio_bytes: bytes | None = None,
+    audio_mime_type: str | None = None,
 ) -> dict:
     """
     Procesa una imagen de boceto o pizarra mediante análisis visual y genera entidades UML.
+    Soporta opcionalmente audio complementario (nota de voz explicativa).
     """
     clean_uid = _clean_user_id(user_id)
     conv = await get_or_create_conversation(
@@ -498,17 +501,22 @@ async def process_vision_image(
     )
 
     # 1. Mensaje de usuario indicando imagen subida
+    default_text = (
+        "[Imagen y nota de voz adjuntadas para análisis OCR]"
+        if audio_bytes
+        else "[Imagen de diagrama adjuntada para análisis OCR]"
+    )
     user_msg = ChatMessage(
         id=str(uuid.uuid4()),
         conversation_id=conv.id,
         sender_type=ActorTypeEnum.user,
         user_id=clean_uid,
-        content_text=prompt or "[Imagen de diagrama adjuntada para análisis OCR]",
+        content_text=prompt or default_text,
     )
     db.add(user_msg)
     await db.flush()
 
-    # 1.b Guardar adjunto en ChatAttachment y disco
+    # 1.b Guardar adjunto de imagen en ChatAttachment y disco
     attachment_id = str(uuid.uuid4())
     storage_url = save_attachment_file(board_id, attachment_id, image_bytes, mime_type)
     attachment = ChatAttachment(
@@ -520,6 +528,23 @@ async def process_vision_image(
         order_index=0,
     )
     db.add(attachment)
+
+    # 1.c Guardar adjunto de audio si existe
+    if audio_bytes:
+        audio_att_id = str(uuid.uuid4())
+        audio_storage_url = save_attachment_file(
+            board_id, audio_att_id, audio_bytes, audio_mime_type or "audio/wav"
+        )
+        audio_attachment = ChatAttachment(
+            id=audio_att_id,
+            chat_message_id=user_msg.id,
+            type=AttachmentType.audio,
+            storage_url=audio_storage_url,
+            mime_type=audio_mime_type or "audio/wav",
+            order_index=1,
+        )
+        db.add(audio_attachment)
+
     await db.flush()
 
     # 2. Análisis multimodal con Vertex AI
@@ -528,6 +553,8 @@ async def process_vision_image(
         mime_type=mime_type,
         user_prompt=prompt,
         current_state=current_state,
+        audio_bytes=audio_bytes,
+        audio_mime_type=audio_mime_type,
     )
 
     mapped_actions = _tool_calls_to_commands(tool_calls, current_state, source="image_ocr")

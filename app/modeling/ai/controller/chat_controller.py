@@ -225,6 +225,7 @@ async def send_chat_message(
 async def upload_diagram_image_for_ocr(
     board_id: str,
     file: UploadFile = File(...),
+    audio_file: UploadFile | None = File(None),
     prompt: str | None = Form(None),
     user_id: str | None = Form(None),
     conversation_id: str | None = Form(None),
@@ -233,6 +234,7 @@ async def upload_diagram_image_for_ocr(
 ):
     """
     Endpoint para análisis de bocetos o pizarras con OCR y visión artificial.
+    Soporta audio adicional para instrucciones de voz sobre la imagen.
     Extrae entidades y genera comandos para el lienzo.
     """
     content_bytes = await file.read()
@@ -240,6 +242,14 @@ async def upload_diagram_image_for_ocr(
         raise HTTPException(status_code=400, detail="El archivo está vacío")
 
     mime_type = file.content_type or "image/png"
+    audio_bytes = None
+    audio_mime = None
+    if audio_file is not None:
+        raw_audio = await audio_file.read()
+        if raw_audio:
+            audio_bytes = raw_audio
+            audio_mime = audio_file.content_type or "audio/wav"
+
     state = await get_normalized_board_state(db, board_id) or {}
     caller_user_id = _sanitize_user_id(auth)
 
@@ -252,6 +262,8 @@ async def upload_diagram_image_for_ocr(
         current_state=state,
         prompt=prompt,
         conversation_id=conversation_id,
+        audio_bytes=audio_bytes,
+        audio_mime_type=audio_mime,
     )
     return result
 

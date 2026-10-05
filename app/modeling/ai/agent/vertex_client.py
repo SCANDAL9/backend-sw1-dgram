@@ -291,12 +291,16 @@ class VertexAIClient:
         mime_type: str = "image/png",
         user_prompt: str | None = None,
         current_state: dict | None = None,
+        audio_bytes: bytes | None = None,
+        audio_mime_type: str | None = None,
     ) -> tuple[str, list[dict]]:
         """
         Vision OCR Multimodal: Analiza una imagen de pizarra o boceto en papel y extrae clases y relaciones.
+        Soporta audio adicional simultáneo para instrucciones por voz sobre el boceto.
         """
         token, project = self._get_auth_token_and_project()
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8") if audio_bytes else None
 
         if not token or not project:
             logger.info("Vertex AI no configurado para Vision. Usando fallback de OCR de prueba.")
@@ -351,23 +355,33 @@ class VertexAIClient:
         prompt_text = (
             user_prompt
             or "Analiza esta imagen que contiene un diagrama UML o ER dibujado a mano/pizarra. "
+            "Si se adjuntó audio, escucha las instrucciones complementarias del usuario. "
             "Extrae con precisión todas las entidades/clases, sus atributos con sus tipos de datos (y si son PK/FK), "
             "y las relaciones o asociaciones entre ellas. Usa las herramientas de función para crearlas todas."
         )
+
+        parts: list[dict[str, Any]] = [
+            {
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": b64_image,
+                }
+            }
+        ]
+        if b64_audio:
+            parts.append({
+                "inline_data": {
+                    "mime_type": audio_mime_type or "audio/wav",
+                    "data": b64_audio,
+                }
+            })
+        parts.append({"text": prompt_text})
 
         body: dict[str, Any] = {
             "contents": [
                 {
                     "role": "user",
-                    "parts": [
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": b64_image,
-                            }
-                        },
-                        {"text": prompt_text},
-                    ],
+                    "parts": parts,
                 }
             ],
             "tools": VERTEX_TOOLS,
