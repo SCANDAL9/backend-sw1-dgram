@@ -2,8 +2,14 @@
 Schema Exceptions — Custom exceptions for schema parsing, XMI transformation, and DDL export.
 """
 
+
 class SchemaException(Exception):
     """Base exception for schema operations."""
+    pass
+
+
+class BoardNotFoundException(SchemaException):
+    """Raised when a requested board is not found."""
     pass
 
 
