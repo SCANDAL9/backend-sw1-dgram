@@ -5,7 +5,6 @@ Soporta Function Calling en tiempo real y Vision OCR multimodal.
 """
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from app.modeling.ai.entity.chat_entity import (
     ChatConversation, ChatMessage, ChatAttachment, AttachmentType,
     AiAction, ActionStatus, ActorTypeEnum,
@@ -14,6 +13,7 @@ from app.modeling.diagram.dto.command_dto import Command, CommandType, CommandPa
 from app.modeling.diagram.dto.command_payload_dto import ColumnData
 from app.modeling.ai.agent.vertex_client import vertex_ai_client
 from app.modeling.ai.service.attachment_storage_service import save_attachment_file
+from app.modeling.ai.repository.chat_repository import ChatRepository
 
 
 def parse_intent_and_generate_commands(user_prompt: str, current_state: dict) -> tuple[str, list[dict]]:
@@ -48,40 +48,13 @@ async def get_or_create_conversation(
     conversation_id: str | None = None,
     force_new: bool = False,
 ) -> ChatConversation:
-    clean_uid = _clean_user_id(user_id)
-    if not force_new and conversation_id:
-        stmt = (
-            select(ChatConversation)
-            .where(
-                ChatConversation.board_id == board_id,
-                ChatConversation.id == conversation_id,
-            )
-        )
-        res = await db.execute(stmt)
-        conv = res.scalar_one_or_none()
-        if conv:
-            return conv
-
-    if not force_new:
-        stmt = (
-            select(ChatConversation)
-            .where(ChatConversation.board_id == board_id)
-            .order_by(ChatConversation.created_at.desc())
-        )
-        res = await db.execute(stmt)
-        conv = res.scalar_one_or_none()
-        if conv:
-            return conv
-
-    conv = ChatConversation(
-        id=str(uuid.uuid4()),
+    repo = ChatRepository(db)
+    return await repo.get_or_create_conversation(
         board_id=board_id,
-        started_by=clean_uid,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        force_new=force_new,
     )
-    db.add(conv)
-    await db.commit()
-    await db.refresh(conv)
-    return conv
 
 
 def _tool_calls_to_commands(
@@ -421,7 +394,8 @@ async def process_chat_message(
     Procesa un mensaje de chat mediante Vertex AI, persiste en BD y ejecuta acciones.
     """
     clean_uid = _clean_user_id(user_id)
-    conv = await get_or_create_conversation(db, board_id, clean_uid)
+    repo = ChatRepository(db)
+    conv = await repo.get_or_create_conversation(board_id, clean_uid)
 
     # 1. Guardar mensaje del usuario
     user_msg = ChatMessage(
@@ -431,8 +405,7 @@ async def process_chat_message(
         user_id=clean_uid,
         content_text=content,
     )
-    db.add(user_msg)
-    await db.flush()
+    await repo.save_message(user_msg)
 
     # 2. Generar respuesta con Vertex AI (o fallback)
     reply_text, tool_calls = await vertex_ai_client.generate_chat_response(
@@ -451,11 +424,11 @@ async def process_chat_message(
         user_id=None,
         content_text=reply_text,
     )
-    db.add(ai_msg)
-    await db.flush()
+    await repo.save_message(ai_msg)
 
     # 5. Registrar cada ai_action
     generated_commands = []
+    actions_to_save = []
     for item in mapped_actions:
         tool_name, tool_args, cmd, status = item[0], item[1], item[2], item[3]
         action = AiAction(
@@ -466,11 +439,12 @@ async def process_chat_message(
             status=status,
             board_history_id=None,
         )
-        db.add(action)
+        actions_to_save.append(action)
         if cmd:
             generated_commands.append(cmd.model_dump())
 
-    await db.commit()
+    await repo.save_actions(actions_to_save)
+    await repo.commit()
 
     return {
         "reply": reply_text,
@@ -496,8 +470,9 @@ async def process_vision_image(
     Soporta opcionalmente audio complementario (nota de voz explicativa).
     """
     clean_uid = _clean_user_id(user_id)
-    conv = await get_or_create_conversation(
-        db, board_id, clean_uid, conversation_id=conversation_id
+    repo = ChatRepository(db)
+    conv = await repo.get_or_create_conversation(
+        board_id, clean_uid, conversation_id=conversation_id
     )
 
     # 1. Mensaje de usuario indicando imagen subida
@@ -513,8 +488,7 @@ async def process_vision_image(
         user_id=clean_uid,
         content_text=prompt or default_text,
     )
-    db.add(user_msg)
-    await db.flush()
+    await repo.save_message(user_msg)
 
     # 1.b Guardar adjunto de imagen en ChatAttachment y disco
     attachment_id = str(uuid.uuid4())
@@ -527,7 +501,7 @@ async def process_vision_image(
         mime_type=mime_type,
         order_index=0,
     )
-    db.add(attachment)
+    await repo.save_attachment(attachment)
 
     # 1.c Guardar adjunto de audio si existe
     if audio_bytes:
@@ -543,9 +517,7 @@ async def process_vision_image(
             mime_type=audio_mime_type or "audio/wav",
             order_index=1,
         )
-        db.add(audio_attachment)
-
-    await db.flush()
+        await repo.save_attachment(audio_attachment)
 
     # 2. Análisis multimodal con Vertex AI
     reply_text, tool_calls = await vertex_ai_client.analyze_diagram_image(
@@ -567,11 +539,11 @@ async def process_vision_image(
         user_id=None,
         content_text=reply_text,
     )
-    db.add(ai_msg)
-    await db.flush()
+    await repo.save_message(ai_msg)
 
     # 4. Registrar acciones
     generated_commands = []
+    actions_to_save = []
     for item in mapped_actions:
         tool_name, tool_args, cmd, status = item[0], item[1], item[2], item[3]
         action = AiAction(
@@ -582,11 +554,12 @@ async def process_vision_image(
             status=status,
             board_history_id=None,
         )
-        db.add(action)
+        actions_to_save.append(action)
         if cmd:
             generated_commands.append(cmd.model_dump())
 
-    await db.commit()
+    await repo.save_actions(actions_to_save)
+    await repo.commit()
 
     return {
         "reply": reply_text,

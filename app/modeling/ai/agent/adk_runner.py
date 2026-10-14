@@ -15,17 +15,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.modeling.ai.agent.vertex_client import vertex_ai_client
 from app.modeling.ai.agent.agent_session import AgentSessionState
+from app.modeling.ai.agent import agent_tools
 from app.modeling.ai.agent.agent_tools import (
-    tool_get_class_details,
-    tool_get_diagram_summary,
-    tool_execute_diagram_command,
-    tool_emit_ui_action,
-    tool_get_project_memory,
     ClassDetail,
     DiagramSummary,
     CommandExecutionResult,
 )
 from app.modeling.diagram.dto.command_dto import CommandType
+
+tool_get_class_details = agent_tools.tool_get_class_details
+tool_get_diagram_summary = agent_tools.tool_get_diagram_summary
+tool_execute_diagram_command = agent_tools.tool_execute_diagram_command
+tool_emit_ui_action = agent_tools.tool_emit_ui_action
+tool_get_project_memory = agent_tools.tool_get_project_memory
 
 logger = logging.getLogger(__name__)
 
@@ -211,17 +213,17 @@ class ADKAgentRunner:
         try:
             if tool_name == "get_class_details":
                 class_name = tool_args.get("class_name", "")
-                detail = await tool_get_class_details(db, board_id, class_name)
+                detail = await agent_tools.tool_get_class_details(db, board_id, class_name)
                 output_dict = detail.model_dump() if detail else {"found": False, "class_name": class_name}
 
             elif tool_name == "get_diagram_summary":
-                summary = await tool_get_diagram_summary(db, board_id)
+                summary = await agent_tools.tool_get_diagram_summary(db, board_id)
                 output_dict = summary.model_dump()
 
             elif tool_name == "execute_diagram_command":
                 cmd_type = tool_args.get("command_type", "")
                 payload = tool_args.get("payload", {})
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
@@ -232,7 +234,7 @@ class ADKAgentRunner:
                 output_dict = res.model_dump()
 
             elif tool_name == "get_project_memory":
-                items = await tool_get_project_memory(db, board_id)
+                items = await agent_tools.tool_get_project_memory(db, board_id)
                 output_dict = {"memories": [i.model_dump() for i in items]}
 
             elif tool_name == "emit_ui_action":
@@ -241,7 +243,7 @@ class ADKAgentRunner:
                 pulse_color = tool_args.get("pulse_color", "indigo")
                 tab = tool_args.get("tab")
                 message = tool_args.get("message")
-                action_res = await tool_emit_ui_action(
+                action_res = await agent_tools.tool_emit_ui_action(
                     board_id=board_id,
                     action_type=action_type,
                     target_id=target_id,
@@ -253,7 +255,7 @@ class ADKAgentRunner:
 
 
             elif tool_name == "create_package":
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
@@ -264,7 +266,7 @@ class ADKAgentRunner:
                 output_dict = res.model_dump()
 
             elif tool_name == "assign_package":
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
@@ -278,7 +280,7 @@ class ADKAgentRunner:
                 output_dict = res.model_dump()
 
             elif tool_name == "resize_entity":
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
@@ -294,7 +296,7 @@ class ADKAgentRunner:
 
             # Compatibilidad directa si Gemini invoca nombres canónicos anteriores:
             elif tool_name == "create_class":
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
@@ -305,7 +307,7 @@ class ADKAgentRunner:
                 output_dict = res.model_dump()
 
             elif tool_name == "add_attribute":
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
@@ -316,7 +318,7 @@ class ADKAgentRunner:
                 output_dict = res.model_dump()
 
             elif tool_name == "create_association":
-                res = await tool_execute_diagram_command(
+                res = await agent_tools.tool_execute_diagram_command(
                     db=db,
                     board_id=board_id,
                     user_id=user_id,
