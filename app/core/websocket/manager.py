@@ -1,3 +1,4 @@
+import asyncio
 import random
 import logging
 from fastapi import WebSocket
@@ -23,6 +24,11 @@ class ConnectionManager:
     def __init__(self):
         self.rooms: dict[str, dict[str, WebSocket]] = {}
         self.presence: dict[str, dict[str, dict]] = {}
+        self._empty_room_hooks: list = []
+
+    def register_empty_room_hook(self, hook) -> None:
+        """Registra un hook (síncrono o asíncrono) invocado con board_id al vaciarse la sala."""
+        self._empty_room_hooks.append(hook)
 
     async def connect(self, websocket: WebSocket, board_id: str, user_id: str) -> None:
         await websocket.accept()
@@ -60,6 +66,14 @@ class ConnectionManager:
                 del self.presence[board_id]
                 # Cancel relay — room is empty on this replica
                 stop_relay_if_empty(board_id, self)
+                # Desalojo de memoria y persistencia de recursos asociados
+                for hook in self._empty_room_hooks:
+                    try:
+                        res = hook(board_id)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as exc:
+                        logger.warning("Error en hook de sala vacía para board %s: %s", board_id, exc)
             else:
                 await self.broadcast(
                     board_id,

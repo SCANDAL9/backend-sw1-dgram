@@ -122,3 +122,27 @@ def sync_remote_yjs_update(board_id: str, b64_update: str) -> bool:
     except Exception as exc:
         logger.error("[YjsHandler] Failed to apply remote Yjs update for board %s: %s", board_id, exc)
         return False
+
+
+async def evict_yjs_doc(board_id: str) -> None:
+    """
+    Desaloja el pycrdt.Doc en memoria cuando el board ya no tiene conexiones activas.
+    Si hay una persistencia diferida pendiente, la ejecuta inmediatamente antes de desalojar.
+    """
+    task = _persist_tasks.pop(board_id, None)
+    if task and not task.done():
+        task.cancel()
+        doc = _active_docs.get(board_id)
+        if doc:
+            try:
+                snapshot_bytes = doc.get_update()
+                async with async_session_factory() as db:
+                    await save_ydoc_state(db, board_id, snapshot_bytes)
+            except Exception as e:
+                logger.error("[YjsHandler] Error flushing ydoc state on eviction for board %s: %s", board_id, e)
+    _active_docs.pop(board_id, None)
+    _state_buffers.pop(board_id, None)
+
+
+manager.register_empty_room_hook(evict_yjs_doc)
+

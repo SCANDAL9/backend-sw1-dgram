@@ -12,6 +12,7 @@ from app.workspace.history.service.state_reconstructor_service import get_normal
 from app.core.config import get_settings
 from app.core.security import decode_jwt_token
 from app.workspace.projects.service.project_authorization import check_board_access
+from app.core.websocket.rate_limiter import rate_limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -119,6 +120,14 @@ def _get_handler(board_id: str) -> CommandHandler:
         history = CommandHistory(board_id)
         _handlers[board_id] = CommandHandler(board_id, history)
     return _handlers[board_id]
+
+
+def evict_handler(board_id: str) -> None:
+    """Desaloja el CommandHandler en memoria cuando el board ya no tiene conexiones activas."""
+    _handlers.pop(board_id, None)
+
+
+manager.register_empty_room_hook(evict_handler)
 
 
 def sync_remote_command_to_handler(board_id: str, command_input: dict | Command) -> bool:
@@ -233,6 +242,31 @@ async def websocket_endpoint(
             data = await websocket.receive_json()
             msg_type = data.get("type")
 
+            # Control de tasa (Rate Limiting) con Token Bucket
+            allowed, category = rate_limiter.is_allowed(actual_user_id, msg_type)
+            if not allowed:
+                if category == "ephemeral":
+                    continue
+                if category == "mutation":
+                    await manager.send_personal(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": "Rate limit exceeded: demasiados comandos, reduce la frecuencia.",
+                        },
+                    )
+                    continue
+                if category == "chat":
+                    await manager.send_personal(
+                        websocket,
+                        {
+                            "type": "error",
+                            "message": "Rate limit exceeded: por favor espera antes de enviar más mensajes.",
+                        },
+                    )
+                    continue
+                continue
+
             # Viewers cannot send mutations
             if role == "viewer" and msg_type in ("command:send", "yjs:update"):
                 await manager.send_personal(
@@ -296,6 +330,7 @@ async def websocket_endpoint(
             exc_info=True,
         )
     finally:
+        rate_limiter.clear_user(actual_user_id)
         await manager.disconnect(board_id, actual_user_id)
 
 

@@ -51,65 +51,85 @@ async def _relay_loop(board_id: str, mgr: "ConnectionManager") -> None:
     """Subscribe to Redis, synchronize local replica memory state, and forward to local connections."""
     channel = f"board:{board_id}"
     logger.debug("Relay started for board %s (replica=%s)", board_id, REPLICA_ID)
-    try:
-        async for msg in pubsub.subscribe(channel):
-            # Skip messages that originated on THIS replica (already sent locally)
-            if msg.get("_replica_id") == REPLICA_ID:
-                continue
+    backoff = 1.0
+    while True:
+        try:
+            # Check if there are still active local connections for this board
+            if not mgr.rooms.get(board_id):
+                break
 
-            exclude = msg.pop("_exclude", None)
-            msg.pop("_replica_id", None)
-
-            # Sincronizar el estado en memoria de esta réplica receptora
-            msg_type = msg.get("type")
-            data_payload = msg.get("data", {})
-
-            try:
-                if msg_type == "command:executed":
-                    from app.core.websocket.handlers import sync_remote_command_to_handler
-                    sync_remote_command_to_handler(board_id, data_payload)
-
-                elif msg_type == "yjs:update":
-                    from app.core.websocket.yjs_handler import sync_remote_yjs_update
-                    b64_update = data_payload.get("update")
-                    if b64_update:
-                        sync_remote_yjs_update(board_id, b64_update)
-
-                elif msg_type in ("cursor:update", "presence:selection", "user:joined"):
-                    uid = data_payload.get("user_id")
-                    if uid:
-                        mgr.update_remote_presence(board_id, uid, data_payload)
-
-                elif msg_type == "user:left":
-                    uid = data_payload.get("user_id")
-                    if uid:
-                        mgr.remove_remote_presence(board_id, uid)
-
-                elif msg_type == "member:kicked":
-                    kicked_uid = msg.get("user_id")
-                    kicked_reason = msg.get("reason", "Acceso revocado")
-                    if kicked_uid:
-                        await mgr.kick_local(board_id, kicked_uid, kicked_reason)
+            async for msg in pubsub.subscribe(channel):
+                backoff = 1.0  # Reset backoff on successful delivery
+                # Skip messages that originated on THIS replica (already sent locally)
+                if msg.get("_replica_id") == REPLICA_ID:
                     continue
-            except Exception as sync_exc:
-                logger.warning(
-                    "Error al sincronizar estado en réplica local para mensaje %s en board %s: %s",
-                    msg_type,
-                    board_id,
-                    sync_exc,
-                )
 
-            for uid, ws in list(mgr.rooms.get(board_id, {}).items()):
-                if uid != exclude:
-                    try:
-                        await ws.send_json(msg)
-                    except Exception as exc:
-                        logger.debug("Fallo enviando relay a websocket de user %s: %s", uid, exc)
+                exclude = msg.pop("_exclude", None)
+                msg.pop("_replica_id", None)
 
-    except asyncio.CancelledError:
-        logger.debug("Relay cancelled for board %s", board_id)
-    except Exception as exc:
-        logger.error("Relay error for board %s: %s", board_id, exc)
+                # Sincronizar el estado en memoria de esta réplica receptora
+                msg_type = msg.get("type")
+                data_payload = msg.get("data", {})
+
+                try:
+                    if msg_type == "command:executed":
+                        from app.core.websocket.handlers import sync_remote_command_to_handler
+                        sync_remote_command_to_handler(board_id, data_payload)
+
+                    elif msg_type == "yjs:update":
+                        from app.core.websocket.yjs_handler import sync_remote_yjs_update
+                        b64_update = data_payload.get("update")
+                        if b64_update:
+                            sync_remote_yjs_update(board_id, b64_update)
+
+                    elif msg_type in ("cursor:update", "presence:selection", "user:joined"):
+                        uid = data_payload.get("user_id")
+                        if uid:
+                            mgr.update_remote_presence(board_id, uid, data_payload)
+
+                    elif msg_type == "user:left":
+                        uid = data_payload.get("user_id")
+                        if uid:
+                            mgr.remove_remote_presence(board_id, uid)
+
+                    elif msg_type == "member:kicked":
+                        kicked_uid = msg.get("user_id")
+                        kicked_reason = msg.get("reason", "Acceso revocado")
+                        if kicked_uid:
+                            await mgr.kick_local(board_id, kicked_uid, kicked_reason)
+                        continue
+                except Exception as sync_exc:
+                    logger.warning(
+                        "Error al sincronizar estado en réplica local para mensaje %s en board %s: %s",
+                        msg_type,
+                        board_id,
+                        sync_exc,
+                    )
+
+                for uid, ws in list(mgr.rooms.get(board_id, {}).items()):
+                    if uid != exclude:
+                        try:
+                            await ws.send_json(msg)
+                        except Exception as exc:
+                            logger.debug("Fallo enviando relay a websocket de user %s: %s", uid, exc)
+
+            # Si el generador finalizó limpiamente (ej. desuscripción o final de stream en tests), salir
+            break
+
+        except asyncio.CancelledError:
+            logger.debug("Relay cancelled for board %s", board_id)
+            break
+        except Exception as exc:
+            if not mgr.rooms.get(board_id):
+                break
+            logger.warning(
+                "Relay connection error for board %s: %s. Retrying in %.1fs...",
+                board_id,
+                exc,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
 
 def start_relay_if_needed(board_id: str, mgr: "ConnectionManager") -> None:
