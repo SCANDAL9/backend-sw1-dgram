@@ -28,3 +28,16 @@ class BoardRepository:
         )
         res = await self.db.execute(stmt)
         return res.scalar_one_or_none()
+
+    async def get_latest_snapshots_batch(self, board_ids: list[str]) -> dict[str, BoardSnapshot]:
+        """Obtiene el último snapshot para cada board_id en una sola consulta SQL."""
+        if not board_ids:
+            return {}
+        stmt = (
+            select(BoardSnapshot)
+            .distinct(BoardSnapshot.board_id)
+            .where(BoardSnapshot.board_id.in_(board_ids))
+            .order_by(BoardSnapshot.board_id, BoardSnapshot.version.desc())
+        )
+        res = await self.db.execute(stmt)
+        return {s.board_id: s for s in res.scalars().all()}

@@ -68,7 +68,7 @@ class Package(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     project_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("project.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
@@ -86,7 +86,7 @@ class ClassElement(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     package_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("package.id", ondelete="RESTRICT"), nullable=False
+        String(36), ForeignKey("package.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     element_type: Mapped[ClassifierType] = mapped_column(
@@ -126,7 +126,7 @@ class Attribute(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     class_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("class_element.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("class_element.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # Varchar libre: el catálogo de tipos SQL es amplio y varía por motor
@@ -158,10 +158,10 @@ class Association(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     source_class_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("class_element.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("class_element.id", ondelete="CASCADE"), nullable=False, index=True
     )
     target_class_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("class_element.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("class_element.id", ondelete="CASCADE"), nullable=False, index=True
     )
     type: Mapped[AssociationType] = mapped_column(
         SAEnum(AssociationType, name="association_type"), nullable=False,

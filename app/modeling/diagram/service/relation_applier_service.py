@@ -27,6 +27,12 @@ def apply_relation_command(relations: dict, command_type: str, payload: dict) ->
             if rel_id in relations:
                 if payload.get("relation_type"):
                     relations[rel_id]["type"] = payload["relation_type"]
+                src = payload.get("source_entity_id") or payload.get("source_id") or payload.get("source_class_id")
+                if src is not None:
+                    relations[rel_id]["source_id"] = src
+                tgt = payload.get("target_entity_id") or payload.get("target_id") or payload.get("target_class_id")
+                if tgt is not None:
+                    relations[rel_id]["target_id"] = tgt
                 if payload.get("source_column") is not None:
                     relations[rel_id]["source_column"] = payload["source_column"]
                 if payload.get("target_column") is not None:

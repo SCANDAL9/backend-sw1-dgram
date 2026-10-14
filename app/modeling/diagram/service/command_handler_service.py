@@ -6,17 +6,19 @@ from app.modeling.diagram.service.relation_applier_service import apply_relation
 from app.workspace.history.service.command_history_service import CommandHistory
 
 ENTITY_COMMANDS = {
-    "CREATE_ENTITY", "DELETE_ENTITY", "UPDATE_ENTITY", "MOVE_ENTITY",
+    "CREATE_ENTITY", "DELETE_ENTITY", "DETACH_ENTITY", "UPDATE_ENTITY", "MOVE_ENTITY",
     "ADD_COLUMN", "UPDATE_COLUMN", "DELETE_COLUMN",
-    "CREATE_CLASS", "DELETE_CLASS", "UPDATE_CLASS", "MOVE_CLASS",
+    "CREATE_CLASS", "DELETE_CLASS", "DETACH_CLASS", "UPDATE_CLASS", "MOVE_CLASS",
     "ADD_ATTRIBUTE", "UPDATE_ATTRIBUTE", "DELETE_ATTRIBUTE",
     "RESIZE_ENTITY", "RESIZE_CLASS", "ASSIGN_CLASS_PACKAGE",
+    "REORDER_ATTRIBUTES",
 }
 
 RELATION_COMMANDS = {
     "CREATE_RELATION", "UPDATE_RELATION", "DELETE_RELATION",
     "CREATE_ASSOCIATION", "UPDATE_ASSOCIATION", "DELETE_ASSOCIATION",
     "LINK_ASSOCIATION_CLASS", "UNLINK_ASSOCIATION_CLASS",
+    "CREATE_ASSOCIATION_CLASS",
 }
 
 PACKAGE_COMMANDS = {
@@ -25,7 +27,7 @@ PACKAGE_COMMANDS = {
 
 # Map UML → ER para normalizar payload antes de aplicar
 _ENTITY_ALIAS = {
-    "CREATE_CLASS": "CREATE_ENTITY", "DELETE_CLASS": "DELETE_ENTITY",
+    "CREATE_CLASS": "CREATE_ENTITY", "DELETE_CLASS": "DELETE_ENTITY", "DETACH_CLASS": "DETACH_ENTITY",
     "UPDATE_CLASS": "UPDATE_ENTITY", "MOVE_CLASS": "MOVE_ENTITY",
     "ADD_ATTRIBUTE": "ADD_COLUMN", "UPDATE_ATTRIBUTE": "UPDATE_COLUMN",
     "DELETE_ATTRIBUTE": "DELETE_COLUMN",
@@ -130,6 +132,13 @@ class CommandHandler:
         if raw_type in ENTITY_COMMANDS or cmd_type in ENTITY_COMMANDS:
             apply_entity_command(self.entities, cmd_type, payload)
 
+        if raw_type == "CREATE_ASSOCIATION_CLASS":
+            cid = payload.get("class_id") or payload.get("entity_id") or str(uuid.uuid4())
+            payload["class_id"] = cid
+            payload["entity_id"] = cid
+            apply_entity_command(self.entities, "CREATE_ENTITY", payload)
+            apply_relation_command(self.relations, "LINK_ASSOCIATION_CLASS", payload)
+
         if raw_type in RELATION_COMMANDS or cmd_type in RELATION_COMMANDS:
             if cmd_type == "CREATE_RELATION":
                 src = payload.get("source_entity_id")
@@ -203,7 +212,7 @@ class CommandHandler:
                     if e.get("package_id") == pkg_id:
                         e["package_id"] = "default"
 
-        if cmd_type == "DELETE_ENTITY":
+        if cmd_type in ("DELETE_ENTITY", "DETACH_ENTITY"):
             eid = payload.get("entity_id") or command.payload.entity_id or command.payload.class_id
             if eid:
                 self.relations = {

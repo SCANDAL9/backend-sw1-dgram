@@ -25,7 +25,7 @@ def apply_entity_command(entities: dict, command_type: str, payload: dict) -> No
                 "is_abstract": bool(payload.get("is_abstract", False)),
             }
 
-        case "DELETE_ENTITY":
+        case "DELETE_ENTITY" | "DETACH_ENTITY":
             entities.pop(entity_id, None)
 
         case "UPDATE_ENTITY":
@@ -72,6 +72,14 @@ def apply_entity_command(entities: dict, command_type: str, payload: dict) -> No
                 for col in entities[entity_id]["columns"]:
                     if col.get("name") == col_name:
                         col.update(changes)
+                        if "isDerived" in changes:
+                            col["is_derived"] = changes["isDerived"]
+                        if "is_derived" in changes:
+                            col["isDerived"] = changes["is_derived"]
+                        if "defaultValue" in changes:
+                            col["default_value"] = changes["defaultValue"]
+                        if "default_value" in changes:
+                            col["defaultValue"] = changes["default_value"]
 
         case "DELETE_COLUMN":
             if entity_id in entities:
@@ -79,3 +87,16 @@ def apply_entity_command(entities: dict, command_type: str, payload: dict) -> No
                 entities[entity_id]["columns"] = [
                     c for c in entities[entity_id]["columns"] if c.get("name") != col_name
                 ]
+
+        case "REORDER_ATTRIBUTES":
+            if entity_id in entities:
+                ordered_names = payload.get("ordered_attribute_names") or payload.get("ordered_names") or []
+                if ordered_names:
+                    current_cols = entities[entity_id].get("columns", [])
+                    col_map = {c.get("name"): c for c in current_cols}
+                    new_cols = []
+                    for name in ordered_names:
+                        if name in col_map:
+                            new_cols.append(col_map.pop(name))
+                    new_cols.extend(col_map.values())
+                    entities[entity_id]["columns"] = new_cols

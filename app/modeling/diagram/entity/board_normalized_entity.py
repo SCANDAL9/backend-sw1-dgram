@@ -70,7 +70,7 @@ class BoardHistory(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     board_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("boards.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True
     )
     # Idempotencia de retry: cliente genera este id antes de enviar
     command_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
@@ -88,7 +88,7 @@ class BoardHistory(Base):
     # Versión del board en el momento de aplicar ESTE comando (no la versión actual)
     model_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
 

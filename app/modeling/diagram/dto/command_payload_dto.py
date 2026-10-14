@@ -60,5 +60,6 @@ class CommandPayload(BaseModel):
     is_abstract: bool | None = None
     is_visible: bool | None = None
     element_type: str | None = None
+    ordered_attribute_names: list[str] | None = None
 
     model_config = {"extra": "allow"}

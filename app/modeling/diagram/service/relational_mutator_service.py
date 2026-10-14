@@ -4,7 +4,7 @@ Muta directamente: class_element, attribute, association, board_element, package
 """
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update
+from sqlalchemy import delete, update, select
 from app.modeling.diagram.entity.board_entity import Board
 from app.workspace.projects.entity.project_entity import Project
 from app.modeling.diagram.entity.uml_entity import (
@@ -14,6 +14,7 @@ from app.modeling.diagram.entity.uml_entity import (
 from app.modeling.diagram.entity.board_normalized_entity import BoardElement
 from app.modeling.diagram.dto.command_dto import Command
 from app.workspace.history.service.state_reconstructor_service import coerce_uuid, parse_assoc_type
+from app.modeling.diagram.repository.element_repository import ElementRepository
 
 
 def parse_visibility(raw_vis: str | None) -> VisibilityEnum:
@@ -61,10 +62,9 @@ def parse_classifier_type(raw_type: str | None) -> ClassifierType:
 
 async def ensure_project_and_package(db: AsyncSession, board: Board) -> tuple[str, str]:
     """Garantiza que el board tenga project_id y un package default."""
+    repo = ElementRepository(db)
     if not board.project_id:
-        proj_stmt = select(Project).where(Project.owner_id == board.owner_id).limit(1)
-        res = await db.execute(proj_stmt)
-        proj = res.scalar_one_or_none()
+        proj = await repo.get_project_by_owner(board.owner_id)
         if not proj:
             proj = Project(
                 id=str(uuid.uuid4()),
@@ -78,9 +78,7 @@ async def ensure_project_and_package(db: AsyncSession, board: Board) -> tuple[st
         await db.flush()
 
     # Buscar o crear package default
-    pkg_stmt = select(Package).where(Package.project_id == board.project_id).limit(1)
-    pkg_res = await db.execute(pkg_stmt)
-    pkg = pkg_res.scalar_one_or_none()
+    pkg = await repo.get_default_package_for_project(board.project_id)
     if not pkg:
         pkg = Package(
             id=str(uuid.uuid4()),
@@ -104,6 +102,7 @@ async def apply_command_to_relational_db(
     if not board:
         return
 
+    repo = ElementRepository(db)
     project_id, package_id = await ensure_project_and_package(db, board)
     cmd_type = command.command_type.value if hasattr(command.command_type, "value") else str(command.command_type)
     payload = command.payload.model_dump() if hasattr(command.payload, "model_dump") else dict(command.payload)
@@ -129,6 +128,28 @@ async def apply_command_to_relational_db(
         # Verificar si ya existe ClassElement
         existing_class = await db.get(ClassElement, class_id)
         if not existing_class:
+            # Validar unicidad en el paquete para evitar colisiones en codegen y modelo
+            dup_stmt = select(ClassElement).where(
+                ClassElement.package_id == chosen_pkg_id,
+                ClassElement.name == class_name,
+            )
+            dup_res = await db.execute(dup_stmt)
+            if dup_res.scalar_one_or_none():
+                suffix = 2
+                candidate = f"{class_name}_{suffix}"
+                while True:
+                    chk = await db.execute(
+                        select(ClassElement).where(
+                            ClassElement.package_id == chosen_pkg_id,
+                            ClassElement.name == candidate,
+                        )
+                    )
+                    if not chk.scalar_one_or_none():
+                        class_name = candidate
+                        break
+                    suffix += 1
+                    candidate = f"{class_name}_{suffix}"
+
             new_class = ClassElement(
                 id=class_id,
                 package_id=chosen_pkg_id,
@@ -160,12 +181,7 @@ async def apply_command_to_relational_db(
                 db.add(attr)
 
         # Garantizar que el BoardElement exista y esté actualizado en este tablero
-        be_stmt = select(BoardElement).where(
-            BoardElement.board_id == board_id,
-            BoardElement.class_id == class_id,
-        )
-        be_res = await db.execute(be_stmt)
-        existing_be = be_res.scalar_one_or_none()
+        existing_be = await repo.get_board_element(board_id, class_id)
         if not existing_be:
             board_elem = BoardElement(
                 id=str(uuid.uuid4()),
@@ -185,7 +201,15 @@ async def apply_command_to_relational_db(
             if h is not None:
                 existing_be.height = float(h)
 
-    # 2. Eliminación de Entidad/Clase
+    # 2. Desvinculación de Entidad/Clase del Tablero (DETACH no destructivo)
+    elif cmd_type in ("DETACH_ENTITY", "DETACH_CLASS"):
+        raw_id = payload.get("entity_id") or payload.get("class_id")
+        if raw_id:
+            class_id = coerce_uuid(raw_id)
+            # Eliminar únicamente la vinculación visual con este tablero (BoardElement), preservando ClassElement en el catálogo
+            await db.execute(delete(BoardElement).where(BoardElement.board_id == board_id, BoardElement.class_id == class_id))
+
+    # 2.b Eliminación Definitiva de Entidad/Clase del Modelo
     elif cmd_type in ("DELETE_ENTITY", "DELETE_CLASS"):
         raw_id = payload.get("entity_id") or payload.get("class_id")
         if raw_id:
@@ -206,13 +230,22 @@ async def apply_command_to_relational_db(
                 old_name = cls_obj.name
                 new_name = payload.get("entity_name") or payload.get("class_name") or payload.get("name")
                 is_type = cls_obj.element_type in (ClassifierType.enumeration, ClassifierType.datatype)
-                if new_name:
-                    cls_obj.name = new_name
-                    if is_type and old_name and new_name != old_name:
+                if new_name and new_name.strip() != old_name:
+                    dup_stmt = select(ClassElement).where(
+                        ClassElement.package_id == cls_obj.package_id,
+                        ClassElement.name == new_name.strip(),
+                        ClassElement.id != class_id,
+                    )
+                    dup_res = await db.execute(dup_stmt)
+                    if dup_res.scalar_one_or_none():
+                        raise ValueError(f"Ya existe otra clase con el nombre '{new_name}' en este paquete.")
+
+                    cls_obj.name = new_name.strip()
+                    if is_type and old_name and new_name.strip() != old_name:
                         await db.execute(
                             update(Attribute)
                             .where(Attribute.data_type == old_name)
-                            .values(data_type=new_name)
+                            .values(data_type=new_name.strip())
                         )
                 elem_type_raw = payload.get("element_type") or payload.get("elementType") or payload.get("stereotype")
                 if elem_type_raw is not None:
@@ -235,9 +268,7 @@ async def apply_command_to_relational_db(
         pos = payload.get("position", {})
         if raw_id and pos:
             class_id = coerce_uuid(raw_id)
-            stmt = select(BoardElement).where(BoardElement.board_id == board_id, BoardElement.class_id == class_id)
-            res = await db.execute(stmt)
-            be = res.scalar_one_or_none()
+            be = await repo.get_board_element(board_id, class_id)
             if be:
                 be.x = float(pos.get("x", be.x))
                 be.y = float(pos.get("y", be.y))
@@ -247,9 +278,7 @@ async def apply_command_to_relational_db(
         raw_id = payload.get("entity_id") or payload.get("class_id")
         if raw_id:
             class_id = coerce_uuid(raw_id)
-            stmt = select(BoardElement).where(BoardElement.board_id == board_id, BoardElement.class_id == class_id)
-            res = await db.execute(stmt)
-            be = res.scalar_one_or_none()
+            be = await repo.get_board_element(board_id, class_id)
             if be:
                 if payload.get("width") is not None:
                     be.width = float(payload["width"])
@@ -307,8 +336,8 @@ async def apply_command_to_relational_db(
                 visibility=parse_visibility(col.get("visibility")),
                 is_pkey=bool(col.get("pk", False)),
                 is_fkey=bool(col.get("fk", False)),
-                is_derived=bool(col.get("is_derived", False)),
-                default_value=col.get("default_value"),
+                is_derived=bool(col.get("is_derived") if "is_derived" in col else col.get("isDerived", False)),
+                default_value=col.get("default_value") if "default_value" in col else col.get("defaultValue"),
                 order_index=int(col.get("order_index", 0)),
             )
             db.add(attr)
@@ -320,9 +349,7 @@ async def apply_command_to_relational_db(
         changes = payload.get("column_changes") or payload.get("attribute_changes") or {}
         if raw_id and col_name:
             class_id = coerce_uuid(raw_id)
-            stmt = select(Attribute).where(Attribute.class_id == class_id, Attribute.name == col_name)
-            res = await db.execute(stmt)
-            attr = res.scalar_one_or_none()
+            attr = await repo.get_attribute_by_name(class_id, col_name)
             if attr:
                 if "name" in changes:
                     attr.name = changes["name"]
@@ -334,10 +361,10 @@ async def apply_command_to_relational_db(
                     attr.is_pkey = bool(changes["pk"])
                 if "fk" in changes:
                     attr.is_fkey = bool(changes["fk"])
-                if "is_derived" in changes:
-                    attr.is_derived = bool(changes["is_derived"])
-                if "default_value" in changes:
-                    attr.default_value = changes["default_value"]
+                if "is_derived" in changes or "isDerived" in changes:
+                    attr.is_derived = bool(changes.get("is_derived") if "is_derived" in changes else changes.get("isDerived"))
+                if "default_value" in changes or "defaultValue" in changes:
+                    attr.default_value = changes.get("default_value") if "default_value" in changes else changes.get("defaultValue")
 
     # 7. Eliminar Columna / Atributo
     elif cmd_type in ("DELETE_COLUMN", "DELETE_ATTRIBUTE"):
@@ -379,12 +406,7 @@ async def apply_command_to_relational_db(
                     if src_t == "interface" and tgt_t in ("class", "abstract_class"):
                         raise ValueError("Una interfaz no puede heredar de una clase.")
                     if src_t in ("class", "abstract_class"):
-                        existing_parent_stmt = select(Association).where(
-                            Association.source_class_id == src_id,
-                            Association.type == AssociationType.generalization,
-                        )
-                        existing_parent_res = await db.execute(existing_parent_stmt)
-                        if existing_parent_res.scalar_one_or_none():
+                        if await repo.get_parent_generalization(src_id, AssociationType.generalization):
                             raise ValueError("Herencia múltiple entre clases no soportada por el modelo relacional ni Spring Boot.")
                 elif parsed_rel_type == AssociationType.realization:
                     if tgt_t != "interface":
@@ -417,6 +439,10 @@ async def apply_command_to_relational_db(
             assoc_id = coerce_uuid(raw_id)
             assoc = await db.get(Association, assoc_id)
             if assoc:
+                if payload.get("source_entity_id") or payload.get("source_id") or payload.get("source_class_id"):
+                    assoc.source_class_id = coerce_uuid(payload.get("source_entity_id") or payload.get("source_id") or payload.get("source_class_id"))
+                if payload.get("target_entity_id") or payload.get("target_id") or payload.get("target_class_id"):
+                    assoc.target_class_id = coerce_uuid(payload.get("target_entity_id") or payload.get("target_id") or payload.get("target_class_id"))
                 if payload.get("name") is not None:
                     assoc.name = payload["name"]
                 if payload.get("relation_type") or payload.get("association_type") or payload.get("type"):
@@ -444,9 +470,7 @@ async def apply_command_to_relational_db(
         if assoc_raw and class_raw:
             assoc_id = coerce_uuid(assoc_raw)
             class_id = coerce_uuid(class_raw)
-            existing_link = await db.scalar(
-                select(AssociationClassLink).where(AssociationClassLink.association_id == assoc_id)
-            )
+            existing_link = await repo.get_association_class_link(assoc_id)
             if existing_link:
                 existing_link.class_id = class_id
             else:
@@ -460,3 +484,74 @@ async def apply_command_to_relational_db(
             await db.execute(
                 delete(AssociationClassLink).where(AssociationClassLink.association_id == assoc_id)
             )
+
+    # 12. Creación Atómica de Clase de Asociación (Association Class)
+    elif cmd_type in ("CREATE_ASSOCIATION_CLASS",):
+        assoc_raw = payload.get("relation_id") or payload.get("association_id")
+        raw_id = payload.get("entity_id") or payload.get("class_id") or str(uuid.uuid4())
+        class_id = coerce_uuid(raw_id)
+        class_name = payload.get("entity_name") or payload.get("class_name") or payload.get("name") or "AssociationClass"
+
+        existing_class = await db.get(ClassElement, class_id)
+        if not existing_class:
+            new_class = ClassElement(
+                id=class_id,
+                package_id=package_id,
+                name=class_name,
+                element_type=ClassifierType.class_,
+                is_abstract=False,
+                is_visible=True,
+                source=ClassSource.manual,
+                created_by=actor_id,
+            )
+            db.add(new_class)
+            await db.flush()
+
+            cols = payload.get("columns") or payload.get("attributes") or []
+            for idx, col in enumerate(cols):
+                attr = Attribute(
+                    id=str(uuid.uuid4()),
+                    class_id=class_id,
+                    name=col.get("name", f"col_{idx}"),
+                    data_type=col.get("type", "VARCHAR"),
+                    visibility=parse_visibility(col.get("visibility")),
+                    is_pkey=bool(col.get("pk", False)),
+                    is_fkey=bool(col.get("fk", False)),
+                    is_derived=bool(col.get("is_derived", False)),
+                    default_value=col.get("default_value"),
+                    order_index=idx,
+                )
+                db.add(attr)
+
+        existing_be = await repo.get_board_element(board_id, class_id)
+        if not existing_be:
+            pos = payload.get("position") or {"x": 250.0, "y": 250.0}
+            board_elem = BoardElement(
+                id=str(uuid.uuid4()),
+                board_id=board_id,
+                class_id=class_id,
+                x=float(pos.get("x", 250.0)),
+                y=float(pos.get("y", 250.0)),
+            )
+            db.add(board_elem)
+
+        if assoc_raw:
+            assoc_id = coerce_uuid(assoc_raw)
+            existing_link = await repo.get_association_class_link(assoc_id)
+            if existing_link:
+                existing_link.class_id = class_id
+            else:
+                db.add(AssociationClassLink(association_id=assoc_id, class_id=class_id))
+
+    # 13. Reordenamiento de Atributos
+    elif cmd_type in ("REORDER_ATTRIBUTES",):
+        raw_id = payload.get("entity_id") or payload.get("class_id")
+        ordered_names = payload.get("ordered_attribute_names") or payload.get("ordered_names") or []
+        if raw_id and ordered_names:
+            class_id = coerce_uuid(raw_id)
+            for idx, attr_name in enumerate(ordered_names):
+                await db.execute(
+                    update(Attribute)
+                    .where(Attribute.class_id == class_id, Attribute.name == attr_name)
+                    .values(order_index=idx)
+                )
