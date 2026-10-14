@@ -1,17 +1,21 @@
 """
 Controller / Router para consulta de historial, timeline, diffs y snapshots (CU7).
+Controlador delgado (Thin Controller) que delega la persistencia a CommandHistory y HistoryRepository.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from app.core.database import get_db
 from app.workspace.history.service.command_history_service import CommandHistory
 from app.workspace.history.service.history_restore_service import restore_board_version
+from app.workspace.history.repository.history_repository import HistoryRepository
 from app.workspace.history.dto.history_dto import (
-    HistoryItemDTO, HistoryDetailDTO, RestoreVersionResponseDTO
+    HistoryItemDTO,
+    HistoryDetailDTO,
+    SnapshotSummaryDTO,
+    RestoreVersionResponseDTO,
 )
-from app.modeling.diagram.entity.board_normalized_entity import BoardSnapshot
+from app.workspace.history.mapper.history_mapper import HistoryMapper
 from app.core.dependencies import require_board_access, BoardAuthContext
 from app.workspace.projects.entity.project_entity import ProjectRole
 
@@ -40,7 +44,7 @@ async def get_board_history(
         from_version=from_version,
         to_version=to_version,
     )
-    return [HistoryItemDTO(**e) for e in entries]
+    return [HistoryMapper.dict_to_item_dto(e) for e in entries]
 
 
 @router.get("/boards/{board_id}/history/{history_id}", response_model=HistoryDetailDTO)
@@ -55,10 +59,10 @@ async def get_history_entry_detail(
     detail = await history.get_entry_detail(history_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Entrada de historial no encontrada")
-    return HistoryDetailDTO(**detail)
+    return HistoryMapper.dict_to_detail_dto(detail)
 
 
-@router.get("/boards/{board_id}/snapshots")
+@router.get("/boards/{board_id}/snapshots", response_model=list[SnapshotSummaryDTO])
 async def get_board_snapshots(
     board_id: str,
     limit: int = Query(30, ge=1, le=100),
@@ -66,22 +70,9 @@ async def get_board_snapshots(
     auth: BoardAuthContext = Depends(require_board_access(ProjectRole.viewer)),
 ):
     """Lista los checkpoints de snapshots persistidos para el tablero."""
-    stmt = (
-        select(BoardSnapshot)
-        .where(BoardSnapshot.board_id == board_id)
-        .order_by(BoardSnapshot.version.desc())
-        .limit(limit)
-    )
-    res = await db.execute(stmt)
-    snapshots = res.scalars().all()
-    return [
-        {
-            "id": s.id,
-            "version": s.version,
-            "created_by": s.created_by,
-        }
-        for s in snapshots
-    ]
+    repo = HistoryRepository(db)
+    snapshots = await repo.get_snapshots(board_id, limit=limit)
+    return [HistoryMapper.snapshot_to_summary_dto(s) for s in snapshots]
 
 
 @router.post("/boards/{board_id}/restore/{version}", response_model=RestoreVersionResponseDTO)
@@ -102,5 +93,5 @@ async def restore_version(
         actor_id=auth.user.id,
         db=db,
     )
-    return RestoreVersionResponseDTO(**result)
+    return HistoryMapper.dict_to_restore_response_dto(result)
 

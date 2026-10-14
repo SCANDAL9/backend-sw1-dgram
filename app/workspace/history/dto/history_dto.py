@@ -40,3 +40,9 @@ class RestoreVersionResponseDTO(BaseModel):
     new_diagram_version: int
     message: str
 
+
+class SnapshotSummaryDTO(BaseModel):
+    id: str
+    version: int
+    created_by: str | None = None
+

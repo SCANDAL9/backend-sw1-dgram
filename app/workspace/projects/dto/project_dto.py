@@ -67,3 +67,27 @@ class ProjectMemoryResponse(BaseModel):
     directive: str
     created_at: str | None = None
     created_by: str | None = None
+
+
+class AttributeSummary(BaseModel):
+    id: str
+    name: str
+    data_type: str
+    visibility: str
+    is_pkey: bool
+
+
+class ProjectClassResponse(BaseModel):
+    id: str
+    name: str
+    package_id: str
+    element_type: str
+    is_abstract: bool
+    attributes: list[AttributeSummary]
+    boards_count: int = 0
+    is_on_current_board: bool = False
+
+
+class AttachClassRequest(BaseModel):
+    x: float = 120.0
+    y: float = 120.0

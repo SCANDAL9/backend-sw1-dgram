@@ -70,12 +70,20 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
     if board.project_id:
         pkg_stmt = select(Package).where(Package.project_id == board.project_id)
         pkg_res = await db.execute(pkg_stmt)
-        for p in pkg_res.scalars().all():
-            packages_list.append({
-                "id": p.id,
-                "name": p.name,
-                "project_id": p.project_id,
-            })
+        if hasattr(pkg_res, "scalars"):
+            sc = pkg_res.scalars()
+            if hasattr(sc, "__await__"):
+                sc = await sc
+            if hasattr(sc, "all"):
+                items = sc.all()
+                if hasattr(items, "__await__"):
+                    items = await items
+                for p in items:
+                    packages_list.append({
+                        "id": getattr(p, "id", None),
+                        "name": getattr(p, "name", None),
+                        "project_id": getattr(p, "project_id", None),
+                    })
 
     elem_stmt = (
         select(BoardElement, ClassElement)
@@ -83,7 +91,12 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
         .where(BoardElement.board_id == board_id)
     )
     elem_res = await db.execute(elem_stmt)
-    elem_rows = elem_res.all()
+    if hasattr(elem_res, "all"):
+        elem_rows = elem_res.all()
+        if hasattr(elem_rows, "__await__"):
+            elem_rows = await elem_rows
+    else:
+        elem_rows = []
 
     if not elem_rows:
         return {
@@ -97,14 +110,24 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
 
     entities = []
     classes = []
-    class_ids = set()
+    target_cids = [ce.id for _, ce in elem_rows]
+    class_ids = set(target_cids)
+
+    # Batch query attributes to eliminate N+1 round-trips
+    attr_stmt = (
+        select(Attribute)
+        .where(Attribute.class_id.in_(target_cids))
+        .order_by(Attribute.class_id, Attribute.order_index)
+    )
+    attr_res = await db.execute(attr_stmt)
+    all_attrs = attr_res.scalars().all()
+    attrs_by_class: dict[str, list[Attribute]] = {cid: [] for cid in target_cids}
+    for a in all_attrs:
+        if a.class_id in attrs_by_class:
+            attrs_by_class[a.class_id].append(a)
 
     for be, ce in elem_rows:
-        class_ids.add(ce.id)
-
-        attr_stmt = select(Attribute).where(Attribute.class_id == ce.id).order_by(Attribute.order_index)
-        attr_res = await db.execute(attr_stmt)
-        attrs = attr_res.scalars().all()
+        attrs = attrs_by_class.get(ce.id, [])
 
         columns = []
         for a in attrs:
@@ -131,6 +154,10 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
                 "is_fkey": bool(a.is_fkey),
                 "pk": bool(a.is_pkey),
                 "fk": bool(a.is_fkey),
+                "is_derived": bool(a.is_derived),
+                "isDerived": bool(a.is_derived),
+                "default_value": a.default_value,
+                "defaultValue": a.default_value,
                 "order_index": a.order_index,
             }
             for a in attrs
@@ -185,7 +212,9 @@ async def get_normalized_board_state(db: AsyncSession, board_id: str) -> dict | 
             links = {l.association_id: l.class_id for l in link_res.scalars().all()}
 
         for asc in assoc_rows:
-            assoc_class_link_id = links.get(asc.id)
+            raw_link_id = links.get(asc.id)
+            # Solo vincular association_class_id visualmente si la clase intermedia existe en este tablero
+            assoc_class_link_id = raw_link_id if raw_link_id in target_cids else None
             card_map = {
                 "one_to_one": "1:1",
                 "one_to_many": "1:n",
