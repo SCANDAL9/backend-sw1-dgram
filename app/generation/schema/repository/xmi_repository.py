@@ -382,6 +382,23 @@ class XmiRepository:
                     self.db.add(assoc_elem)
                     existing_assocs_map[assoc_key] = assoc_elem
 
+                if assoc.get("association_class_id"):
+                    ac_raw = assoc.get("association_class_id")
+                    ac_id = class_id_map.get(ac_raw)
+                    if ac_id and assoc_elem:
+                        await self.db.flush()
+                        acl_stmt = select(AssociationClassLink).where(
+                            AssociationClassLink.association_id == assoc_elem.id,
+                            AssociationClassLink.class_id == ac_id,
+                        )
+                        acl_res = await self.db.execute(acl_stmt)
+                        if not acl_res.scalar_one_or_none():
+                            self.db.add(AssociationClassLink(
+                                id=str(uuid.uuid4()),
+                                association_id=assoc_elem.id,
+                                class_id=ac_id,
+                            ))
+
                 imported_associations += 1
 
             new_version = (board.diagram_version or 0) + 1

@@ -877,14 +877,23 @@ class XmiImporter:
             low_val = end_elem.attrib.get("lower")
             up_val = end_elem.attrib.get("upper")
 
-        if low_val is not None and up_val is not None:
-            if str(low_val) == str(up_val):
-                return str(low_val)
-            return f"{low_val}..{up_val}"
-        elif up_val is not None:
-            return str(up_val)
-        elif low_val is not None:
-            return str(low_val)
+        def _norm(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            s = str(v).strip()
+            return "*" if s in ["-1", "*"] else s
+
+        low_str = _norm(low_val)
+        up_str = _norm(up_val)
+
+        if low_str is not None and up_str is not None:
+            if low_str == up_str:
+                return low_str
+            return f"{low_str}..{up_str}"
+        elif up_str is not None:
+            return up_str
+        elif low_str is not None:
+            return low_str
         return None
 
     def _parse_ea_geometry(self, geom: str) -> Optional[Dict[str, float]]:
@@ -910,6 +919,43 @@ class XmiImporter:
         except Exception:
             return None
 
+    def _resolve_table_overlaps(self, classes: List[Dict[str, Any]], min_gap: float = 50.0) -> None:
+        """
+        Ajusta las posiciones verticales de las tablas para evitar que se solapen debido
+        a la altura real requerida por los atributos en el frontend.
+        """
+        if not classes or len(classes) < 2:
+            return
+
+        # Estimar altura y ancho real para cada clase según cantidad de atributos
+        for c in classes:
+            attrs_count = len(c.get("attributes", []))
+            est_h = max(130.0, 70.0 + attrs_count * 28.0)
+            c["position"]["w"] = max(220.0, float(c["position"].get("w", 220.0)))
+            c["position"]["h"] = max(est_h, float(c["position"].get("h", 120.0)))
+
+        # Ordenar por coordenada Y
+        classes.sort(key=lambda item: (item["position"]["y"], item["position"]["x"]))
+
+        # Realizar pases de resolución de colisiones
+        for _ in range(10):
+            shifted = False
+            for i in range(len(classes)):
+                box_a = classes[i]["position"]
+                for j in range(i + 1, len(classes)):
+                    box_b = classes[j]["position"]
+
+                    # Comprobar solapamiento horizontal
+                    x_overlap = (box_a["x"] < box_b["x"] + box_b["w"]) and (box_a["x"] + box_a["w"] > box_b["x"])
+                    if x_overlap:
+                        # Si colisionan verticalmente o están demasiado cerca
+                        min_y = box_a["y"] + box_a["h"] + min_gap
+                        if box_b["y"] < min_y:
+                            box_b["y"] = min_y
+                            shifted = True
+            if not shifted:
+                break
+
     def parse(self, xml_content: str) -> Dict[str, Any]:
         """
         Parsea el contenido XML y retorna la estructura del modelo, clases, atributos, relaciones y posiciones visuales.
@@ -917,7 +963,11 @@ class XmiImporter:
         if xml_content is None:
             raise ValueError("El contenido XML no puede ser nulo.")
 
-        if len(xml_content.encode("utf-8")) > 10 * 1024 * 1024:
+        if isinstance(xml_content, bytes):
+            if len(xml_content) > 10 * 1024 * 1024:
+                raise ValueError("El archivo XML excede el tamaño máximo permitido de 10 MB.")
+            xml_content = xml_content.decode("utf-8", errors="replace")
+        elif len(xml_content.encode("utf-8")) > 10 * 1024 * 1024:
             raise ValueError("El archivo XML excede el tamaño máximo permitido de 10 MB.")
 
         upper_xml = xml_content.upper()
@@ -936,11 +986,14 @@ class XmiImporter:
         positions: Dict[str, Dict[str, float]] = {}
         packages: List[Dict[str, Any]] = []
         pkg_id_set = set()
+        seen_assoc_ids: Set[str] = set()
 
         # Build parent map for hierarchical package detection
         parent_map = {c: p for p in root.iter() for c in p}
 
-        # 1. Parse EA Geometry extensions if present
+        # 1. Parse EA Geometry and Connectors extensions if present
+        ea_connectors: Dict[str, Dict[str, Any]] = {}
+        ea_assoc_class_links: Dict[str, str] = {}
         for elem in root.iter():
             if elem.tag.endswith("element") and "geometry" in elem.attrib:
                 subject = elem.attrib.get("subject", "")
@@ -948,6 +1001,63 @@ class XmiImporter:
                 parsed_geo = self._parse_ea_geometry(geom)
                 if subject and parsed_geo:
                     positions[subject] = parsed_geo
+            elif elem.tag.endswith("connector"):
+                conn_id = elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}idref") or elem.attrib.get("xmi:idref") or elem.attrib.get("id") or ""
+                if not conn_id:
+                    continue
+                source = elem.find(".//source")
+                target = elem.find(".//target")
+                props = elem.find(".//properties")
+
+                src_id = (
+                    source.attrib.get("{http://schema.omg.org/spec/XMI/2.1}idref")
+                    or source.attrib.get("xmi:idref")
+                    or source.attrib.get("idref")
+                    if source is not None else None
+                )
+                tgt_id = (
+                    target.attrib.get("{http://schema.omg.org/spec/XMI/2.1}idref")
+                    or target.attrib.get("xmi:idref")
+                    or target.attrib.get("idref")
+                    if target is not None else None
+                )
+                ea_type = props.attrib.get("ea_type", "Association") if props is not None else "Association"
+
+                src_role = None
+                tgt_role = None
+                src_mult = None
+                tgt_mult = None
+                if source is not None:
+                    r = source.find(".//role")
+                    if r is not None and r.attrib.get("name"):
+                        src_role = r.attrib.get("name")
+                    m = source.find(".//type")
+                    if m is not None and m.attrib.get("multiplicity"):
+                        src_mult = m.attrib.get("multiplicity")
+                if target is not None:
+                    r = target.find(".//role")
+                    if r is not None and r.attrib.get("name"):
+                        tgt_role = r.attrib.get("name")
+                    m = target.find(".//type")
+                    if m is not None and m.attrib.get("multiplicity"):
+                        tgt_mult = m.attrib.get("multiplicity")
+
+                ea_connectors[conn_id] = {
+                    "sourceId": src_id,
+                    "targetId": tgt_id,
+                    "type": ea_type,
+                    "source_role": src_role,
+                    "target_role": tgt_role,
+                    "source_multiplicity": src_mult,
+                    "target_multiplicity": tgt_mult,
+                }
+            elif elem.tag.endswith("element"):
+                el_id = elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}idref") or elem.attrib.get("xmi:idref") or elem.attrib.get("id") or ""
+                ext = elem.find(".//extendedProperties")
+                if ext is not None and el_id:
+                    con_id = ext.attrib.get("conID")
+                    if con_id:
+                        ea_assoc_class_links[con_id] = el_id
 
         # 2. Parse Packages, Classes & Interfaces
         for elem in root.iter():
@@ -967,7 +1077,15 @@ class XmiImporter:
                     })
                 continue
 
-            if elem_type in ["uml:Class", "uml:Interface", "uml:Enumeration", "uml:DataType"] or elem.tag.endswith("Class") or elem.tag.endswith("Interface") or elem.tag.endswith("Enumeration") or elem.tag.endswith("DataType"):
+            is_assoc_class = elem_type in ["uml:AssociationClass"] or elem.tag.endswith("AssociationClass")
+            if (
+                elem_type in ["uml:Class", "uml:Interface", "uml:Enumeration", "uml:DataType", "uml:AssociationClass"]
+                or elem.tag.endswith("Class")
+                or elem.tag.endswith("Interface")
+                or elem.tag.endswith("Enumeration")
+                or elem.tag.endswith("DataType")
+                or elem.tag.endswith("AssociationClass")
+            ):
                 is_abstract = elem.attrib.get("isAbstract", "false").lower() == "true"
                 if "Enumeration" in elem_type or elem.tag.endswith("Enumeration"):
                     classifier = "enumeration"
@@ -1119,8 +1237,20 @@ class XmiImporter:
                     })
 
             # Association
-            elif elem.tag.endswith("Association") or elem_type == "uml:Association":
+            elif not is_assoc_class and (elem.tag.endswith("Association") or elem_type == "uml:Association"):
                 owned_ends = elem.findall(".//ownedEnd")
+
+                def _extract_end_ref(end_node: ET.Element) -> Optional[str]:
+                    t = end_node.attrib.get("type")
+                    if t:
+                        return t
+                    t_child = end_node.find(".//type")
+                    if t_child is not None:
+                        for attr in ["{http://schema.omg.org/spec/XMI/2.1}idref", "xmi:idref", "idref", "type"]:
+                            val = t_child.attrib.get(attr)
+                            if val:
+                                return val
+                    return None
 
                 src_cls = None
                 tgt_cls = None
@@ -1131,8 +1261,8 @@ class XmiImporter:
                 rel_type = "Association"
 
                 if len(owned_ends) >= 2:
-                    src_cls = owned_ends[0].attrib.get("type")
-                    tgt_cls = owned_ends[1].attrib.get("type")
+                    src_cls = _extract_end_ref(owned_ends[0])
+                    tgt_cls = _extract_end_ref(owned_ends[1])
                     src_role = owned_ends[0].attrib.get("name")
                     tgt_role = owned_ends[1].attrib.get("name")
                     src_mult = self._parse_multiplicity(owned_ends[0])
@@ -1143,11 +1273,29 @@ class XmiImporter:
                     elif agg == "composite":
                         rel_type = "Composition"
 
-                    if rel_type != "Association":
-                        src_mult = None
-                        tgt_mult = None
+                # Fallback to EA connector metadata if src_cls, tgt_cls, roles or multiplicities are missing
+                ea_conn = ea_connectors.get(elem_id)
+                if ea_conn:
+                    if not src_cls:
+                        src_cls = ea_conn.get("sourceId")
+                    if not tgt_cls:
+                        tgt_cls = ea_conn.get("targetId")
+                    if not src_role:
+                        src_role = ea_conn.get("source_role")
+                    if not tgt_role:
+                        tgt_role = ea_conn.get("target_role")
+                    if not src_mult:
+                        src_mult = ea_conn.get("source_multiplicity")
+                    if not tgt_mult:
+                        tgt_mult = ea_conn.get("target_multiplicity")
+                    if rel_type == "Association" and ea_conn.get("type"):
+                        ea_t = ea_conn.get("type")
+                        if ea_t in ["Aggregation", "Composition", "Generalization", "Realization"]:
+                            rel_type = ea_t
 
-                if src_cls and tgt_cls:
+                if src_cls and tgt_cls and elem_id not in seen_assoc_ids:
+                    seen_assoc_ids.add(elem_id)
+                    ac_id = ea_assoc_class_links.get(elem_id)
                     associations.append({
                         "id": elem_id,
                         "sourceId": src_cls,
@@ -1158,7 +1306,28 @@ class XmiImporter:
                         "target_role": tgt_role,
                         "source_multiplicity": src_mult,
                         "target_multiplicity": tgt_mult,
+                        "association_class_id": ac_id,
                     })
+
+        # 3. Add any remaining EA connectors that were not defined as uml:Association packagedElements
+        for conn_id, conn in ea_connectors.items():
+            if conn_id not in seen_assoc_ids and conn.get("sourceId") and conn.get("targetId"):
+                seen_assoc_ids.add(conn_id)
+                associations.append({
+                    "id": conn_id,
+                    "sourceId": conn["sourceId"],
+                    "targetId": conn["targetId"],
+                    "type": conn.get("type", "Association"),
+                    "name": "",
+                    "source_role": conn.get("source_role"),
+                    "target_role": conn.get("target_role"),
+                    "source_multiplicity": conn.get("source_multiplicity"),
+                    "target_multiplicity": conn.get("target_multiplicity"),
+                    "association_class_id": ea_assoc_class_links.get(conn_id),
+                })
+
+        # Resolve vertical collisions / overlapping tables
+        self._resolve_table_overlaps(classes)
 
         return {
             "packages": packages,
