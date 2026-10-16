@@ -62,22 +62,33 @@ class ProjectRepository:
             access_conditions.append(Project.owner_id == user_id)
             access_conditions.append(ProjectMember.user_id == user_id)
 
-        from sqlalchemy import case
+        from sqlalchemy import case, cast, String
 
-        role_expression = case(
-            (Project.owner_id == user_id, "owner"),
-            (Project.owner_id.in_(demo_owners), "owner"),
-            else_=ProjectMember.role,
-        ).label("user_role")
+        if user_id:
+            role_expression = case(
+                (Project.owner_id == user_id, "owner"),
+                (Project.owner_id.in_(demo_owners), "owner"),
+                else_=cast(ProjectMember.role, String),
+            ).label("user_role")
 
-        stmt = (
-            select(Project, role_expression)
-            .outerjoin(
-                ProjectMember,
-                (Project.id == ProjectMember.project_id) & (ProjectMember.user_id == user_id),
+            stmt = (
+                select(Project, role_expression)
+                .outerjoin(
+                    ProjectMember,
+                    (Project.id == ProjectMember.project_id) & (ProjectMember.user_id == user_id),
+                )
+                .where(or_(*access_conditions))
             )
-            .where(or_(*access_conditions))
-        )
+        else:
+            role_expression = case(
+                (Project.owner_id.in_(demo_owners), "owner"),
+                else_="viewer",
+            ).label("user_role")
+
+            stmt = (
+                select(Project, role_expression)
+                .where(or_(*access_conditions))
+            )
 
         if search_filter:
             stmt = stmt.where(
